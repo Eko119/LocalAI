@@ -422,6 +422,110 @@ def test_no_module_references_a_model_runtime_or_vendor_api() -> None:
             assert token not in code, f"{path.name} references {token}"
 
 
+# Ways TLS verification gets disabled. None may appear anywhere in the
+# project — not in production code, and not "just for the live test".
+TLS_WEAKENING_TOKENS = (
+    "verify=false",
+    "verify = false",
+    "_create_unverified_context",
+    "cert_none",
+    "check_hostname = false",
+    "check_hostname=false",
+    "_create_default_https_context",
+    "pythonhttpsverify",
+    "insecureskipverify",
+    "sslcontext(ssl.protocol",
+)
+
+
+# This module necessarily contains every forbidden token as *data* — it is
+# the file that lists them. Excluding exactly one self-referential file keeps
+# the scan honest; `test_the_scan_excludes_only_itself` pins that it stays one.
+SCAN_EXCLUSIONS = frozenset({"test_architecture.py"})
+
+
+def _all_project_python() -> list[pathlib.Path]:
+    """Production source and tests alike — a bypass hidden in a test still counts."""
+    root = SRC.parents[1]
+    return sorted(
+        path
+        for path in root.rglob("*.py")
+        if ".venv" not in path.parts
+        and "__pycache__" not in path.parts
+        and path.name not in SCAN_EXCLUSIONS
+    )
+
+
+def test_the_scan_excludes_only_itself() -> None:
+    """The exclusion list must not quietly grow into a hiding place."""
+    assert SCAN_EXCLUSIONS == frozenset({"test_architecture.py"})
+    scanned = {path.name for path in _all_project_python()}
+    assert "http.py" in scanned and "controller.py" in scanned
+    assert "test_live_localai.py" in scanned and "live_support.py" in scanned
+
+
+def test_tls_verification_is_never_weakened_anywhere() -> None:
+    """No certificate-check bypass, in source or in tests.
+
+    A live integration test that failed against a self-signed certificate
+    would be trivially "fixed" by disabling verification. That fix is a
+    security downgrade hidden in a test file, so it is banned by a check that
+    covers tests too, not only `src/`.
+    """
+    for path in _all_project_python():
+        lowered = path.read_text().lower()
+        for token in TLS_WEAKENING_TOKENS:
+            assert token not in lowered, (
+                f"{path.name} appears to weaken TLS verification: {token!r}"
+            )
+
+
+def test_no_module_disables_certificate_validation_via_environment() -> None:
+    """`PYTHONHTTPSVERIFY=0` and friends must not be set by the project."""
+    for path in _all_project_python():
+        text = path.read_text()
+        for token in ("PYTHONHTTPSVERIFY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            if f'"{token}"' in text or f"'{token}'" in text:
+                raise AssertionError(f"{path.name} manipulates TLS trust via {token}")
+
+
+def test_the_network_boundary_check_actually_catches_a_violation() -> None:
+    """Adversarial test of the test: poison a module and prove the check fails.
+
+    A boundary assertion that could never fail is worthless. This mutates a
+    copy of the controller's source to import a network library and confirms
+    the same predicate the real test uses rejects it.
+    """
+    controller = SRC / "controller.py"
+    poisoned = "import urllib.request\n" + controller.read_text()
+    roots = _imported_roots(ast.parse(poisoned))
+
+    assert roots & NETWORK_MODULES, "the poisoned module was not detected"
+    # And the unmodified original is clean, so the check is not simply always true.
+    assert not _imported_roots(ast.parse(controller.read_text())) & NETWORK_MODULES
+
+
+def test_the_filesystem_boundary_check_actually_catches_a_violation() -> None:
+    policy = SRC / "policy.py"
+    poisoned = "import pathlib\n" + policy.read_text()
+    assert _imported_roots(ast.parse(poisoned)) & FILESYSTEM_MODULES
+    assert not _imported_roots(ast.parse(policy.read_text())) & FILESYSTEM_MODULES
+
+
+def test_production_source_reads_no_environment_variable() -> None:
+    """Configuration is constructed by wiring, never picked up ambiently.
+
+    Env reading lives in the test/ops layer (`tests/live_support.py`). Keeping
+    it out of `src/` is why `os` is not in any production import grant, and it
+    means a deployment cannot be reconfigured by an environment variable that
+    no one declared.
+    """
+    for path in _production_modules():
+        text = path.read_text()
+        for token in ("os.environ", "getenv", "environ["):
+            assert token not in text, f"{path.name} reads the environment via {token}"
+
+
 def test_runtime_dependencies_are_pinned_and_minimal() -> None:
     pyproject = (SRC.parents[1] / "pyproject.toml").read_text()
     dependencies_block = pyproject.split("dependencies = [", 1)[1].split("]", 1)[0]
@@ -470,3 +574,109 @@ def test_the_filesystem_registry_holds_exactly_the_two_read_only_tools(
 
     for forbidden in ("workspace.write", "workspace.delete", "workspace.mkdir", "shell", "exec"):
         assert registry.get(forbidden) is None
+
+
+# ===========================================================================
+# Milestone 4: the twenty architectural invariants, stated in one place
+# ===========================================================================
+#
+# Each of these is covered in depth by a behavioural test elsewhere. Gathering
+# the structural half here gives one file a reader can check the architecture
+# against, and makes a silent erosion of any single invariant fail loudly.
+
+
+def test_invariant_the_controller_is_the_only_authority() -> None:
+    """1, 4: authority objects are constructed by wiring, not by the model layer."""
+    controller = (SRC / "controller.py").read_text()
+    assert "RunContext" in controller  # the controller reads authority
+    for name in ("model_service.py", "model_transport.py", "transports/http.py"):
+        text = (SRC / name).read_text()
+        assert "RunContext" not in text
+        assert "evaluate_policy" not in text
+        assert "authorize(" not in text
+
+
+def test_invariant_model_output_is_untrusted_data() -> None:
+    """2: the only channel the parser reads is the structured one."""
+    import inspect
+
+    from local_agent.controller import parse_candidate
+
+    source = inspect.getsource(parse_candidate)
+    assert "structured_output" in source
+    assert "response.narrative" not in source
+    assert "response.reasoning" not in source
+
+
+def test_invariant_the_transport_holds_no_controller_authority() -> None:
+    """3, 10: the transport imports bytes-level types only."""
+    text = (SRC / "transports" / "http.py").read_text()
+    for forbidden in ("Controller", "RunContext", "ToolRegistry", "State", "TRANSITIONS"):
+        assert forbidden not in text
+
+
+@pytest.mark.parametrize(
+    "setting",
+    ["base_url", "api_key", "model", "timeout_seconds", "max_response_bytes"],
+)
+def test_invariant_the_model_cannot_supply_transport_configuration(setting: str) -> None:
+    """5, 6: no configuration field is reachable from a model-facing contract."""
+    from local_agent.contracts import ModelResponse, RawToolCall
+
+    for model in (ModelResponse, RawToolCall):
+        assert setting not in model.model_fields
+
+
+def test_invariant_budget_policy_and_roots_are_frozen_authority() -> None:
+    """7, 8, 9, 10: the model cannot widen any of them, structurally."""
+    import dataclasses
+
+    from local_agent.model_config import ModelServiceConfig
+    from local_agent.policy import RunContext
+
+    for instance, field_name, value in (
+        (RunContext(run_id="x"), "max_attempts", 999),
+        (RunContext(run_id="x"), "authorized_roots", frozenset({"workspace"})),
+        (RunContext(run_id="x"), "filesystem", None),
+        (ModelServiceConfig(base_url="http://h:1", model="m"), "base_url", "http://evil"),
+    ):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(instance, field_name, value)
+
+
+def test_invariant_the_model_cannot_select_a_state_transition() -> None:
+    """11: no model-facing contract carries a state, and the table is fixed."""
+    from local_agent.contracts import ModelRequest, ModelResponse, RawToolCall
+    from local_agent.state_machine import TRANSITIONS, State
+
+    for model in (ModelResponse, RawToolCall, ModelRequest):
+        assert "state" not in model.model_fields
+    predecessors = {source for source, targets in TRANSITIONS.items() if State.EXECUTE in targets}
+    assert predecessors == {State.POLICY_CHECK}
+
+
+def test_invariant_no_semantic_retry_below_the_controller() -> None:
+    """16, 17, 18: neither adapter nor transport contains a retry loop."""
+    for name in ("model_service.py", "model_transport.py", "transports/http.py"):
+        # Docstrings legitimately explain *why* there is no retry loop, so the
+        # scan looks at executable code only — the same treatment the vendor
+        # reference check uses.
+        code = _code_without_docstrings(SRC / name)
+        for token in ("for attempt", "while attempt", "retries", "max_retries", "backoff"):
+            assert token not in code, f"{name} appears to retry: {token!r}"
+
+
+def test_invariant_normal_ci_does_not_require_localai() -> None:
+    """19: the CI workflow names no model service and no live gate."""
+    workflow = (SRC.parents[2] / ".github" / "workflows" / "local-agent.yml").read_text()
+    for token in ("LOCAL_AGENT_LIVE_MODEL", "LOCALAI_MODEL", "LOCALAI_BASE_URL", "localai/localai"):
+        assert token not in workflow, f"CI references {token}"
+    assert "uv run pytest -q" in workflow
+
+
+def test_invariant_deterministic_replay_never_touches_live_inference() -> None:
+    """20: the replay suite imports no live transport and no environment."""
+    text = (SRC.parents[1] / "tests" / "test_determinism.py").read_text()
+    assert "HttpModelTransport" not in text
+    assert "os.environ" not in text
+    assert "ScriptedTransport" in text or "build_model_harness" in text

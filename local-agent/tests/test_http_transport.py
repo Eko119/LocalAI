@@ -32,12 +32,25 @@ from local_agent.transports.http import HttpModelTransport
 SENTINEL = "sk-transport-sentinel-9911"
 
 
+# Server-side request counter. It is what makes "the client does not retry"
+# a measured fact rather than an assumption about urllib's internals.
+REQUEST_COUNTS: dict[str, int] = {}
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
     """Echoes the request back, or misbehaves in a scripted way."""
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
+        REQUEST_COUNTS[self.path] = REQUEST_COUNTS.get(self.path, 0) + 1
+
+        for status_path, code in (("/401", 401), ("/404", 404), ("/503", 503)):
+            if self.path.endswith(status_path):
+                self.send_response(code)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
 
         if self.path.endswith("/slow"):
             time.sleep(5)
@@ -149,3 +162,80 @@ def test_transport_failures_never_carry_the_host_or_the_credential() -> None:
     assert SENTINEL not in rendered
     assert "127.0.0.1" not in rendered
     assert "Bearer" not in rendered
+
+
+# ===========================================================================
+# Milestone 4: the client must not retry, and status codes must normalize
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("path", "code"), [("/401", 401), ("/404", 404), ("/error", 500), ("/503", 503)]
+)
+def test_error_statuses_normalize_and_are_not_retried(server: str, path: str, code: int) -> None:
+    """One controller attempt must produce exactly one HTTP request.
+
+    A client that quietly retried would multiply the controller's budget
+    without the controller ever knowing. This counts requests on the *server*
+    side, so it measures what actually happened on the wire.
+    """
+    REQUEST_COUNTS.clear()
+
+    with pytest.raises(ModelTransportError) as excinfo:
+        send(server, path)
+
+    assert excinfo.value.reason == f"model_service_status_{code}"
+    assert REQUEST_COUNTS.get(path) == 1, "the HTTP client retried on its own"
+
+
+def test_a_timeout_is_not_retried(server: str) -> None:
+    REQUEST_COUNTS.clear()
+
+    with pytest.raises(ModelTransportTimeout):
+        send(server, "/slow", timeout_seconds=0.3)
+
+    assert REQUEST_COUNTS.get("/slow") == 1
+
+
+def test_controller_attempts_equal_wire_requests_over_a_real_socket(server: str) -> None:
+    """End-to-end proof over HTTP: three attempts, three requests, no more.
+
+    Everything here is production code except the server: the real controller,
+    the real adapter, and the real transport against a real socket.
+    """
+    import asyncio
+
+    from local_agent.controller import Controller
+    from local_agent.model_service import LocalAIModelAdapter
+    from local_agent.policy import RunContext
+    from local_agent.transports.http import HttpModelTransport
+    from local_agent.wiring import build_default_registry, describe_tools
+
+    REQUEST_COUNTS.clear()
+    config = model_config(base_url=server)
+    registry = build_default_registry()
+    adapter = LocalAIModelAdapter(
+        transport=HttpModelTransport(config), config=config, tools=describe_tools(registry)
+    )
+
+    # The echo endpoint returns a body that is not a chat completion, so every
+    # attempt fails verification and the controller spends its whole budget.
+    outcome = asyncio.run(
+        Controller(registry, adapter).run(
+            RunContext(run_id="wire"), [{"role": "user", "content": "hello"}]
+        )
+    )
+
+    assert outcome.terminal.code == "RETRY_EXHAUSTED"
+    assert outcome.attempts == 3
+    assert REQUEST_COUNTS.get("/v1/chat/completions") == 3
+
+
+def test_a_failing_status_does_not_trigger_endpoint_discovery(server: str) -> None:
+    """A 404 must not make the client go looking for another path."""
+    REQUEST_COUNTS.clear()
+
+    with pytest.raises(ModelTransportError):
+        send(server, "/404")
+
+    assert set(REQUEST_COUNTS) == {"/404"}, "the client probed additional endpoints"

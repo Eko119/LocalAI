@@ -215,6 +215,46 @@ a retrying controller would silently make nine.
 **Zero new dependencies** — the transport is stdlib `urllib.request` on a
 worker thread.
 
+## Running against a real LocalAI
+
+The deterministic suite never needs a model server:
+
+    uv run pytest -q              # no LocalAI, no network, no credentials
+
+The live integration tests are opt-in and marked `live`. They skip when the
+gate is absent and **fail loudly** when the gate is present but the service is
+missing or misconfigured — an explicitly requested live run must never
+degrade into a silent skip.
+
+    export LOCAL_AGENT_LIVE_MODEL=1
+    export LOCALAI_MODEL=<a model your instance serves>
+    export LOCALAI_BASE_URL=http://127.0.0.1:8080   # or LOCALAI_ADDRESS=:8080
+    export LOCALAI_API_KEY=<key>                    # only if your instance needs one
+    uv run pytest -m live -q
+
+Variables follow LocalAI's own conventions: `LOCALAI_API_KEY` then `API_KEY`
+for the credential, and `LOCALAI_ADDRESS` for the bind address. Because
+`LOCALAI_ADDRESS` is a *bind* address (`:8080` means "all interfaces"),
+`LOCALAI_BASE_URL` takes precedence and a bare `:8080` is translated to
+`http://127.0.0.1:8080`.
+
+Nothing in `src/` reads an environment variable — configuration is
+constructed explicitly by trusted wiring, and the live tests do the env
+reading themselves.
+
+**Live inference is nondeterministic.** The deterministic replay suite is
+entirely scripted and never contacts a model; live output is deliberately kept
+out of it. What a live run records is structural only — which channels carried
+something, whether the proposal parsed, the normalized error, the controller's
+state trace — never model text, a credential, or a filesystem path.
+
+**TLS is never weakened.** There is no custom-CA support, so an instance behind
+a self-signed certificate will fail verification; that is a deployment
+requirement, not something the tests bypass.
+
+**Normal CI does not require LocalAI**, and PR mergeability does not depend on
+live inference.
+
 ## Layout
 
     src/local_agent/

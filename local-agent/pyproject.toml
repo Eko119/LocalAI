@@ -24,6 +24,9 @@ packages = ["src/local_agent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `live` marks the opt-in LocalAI integration tests. They skip unless
+# LOCAL_AGENT_LIVE_MODEL is set, so the default `pytest -q` needs no server.
+markers = ["live: requires a running LocalAI instance (opt-in, never in CI)"]
 
 [tool.mypy]
 python_version = "3.11"

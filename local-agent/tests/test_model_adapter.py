@@ -13,7 +13,6 @@ that question and asserts the answer is "nothing it was not already allowed".
 from __future__ import annotations
 
 import json
-import os
 
 import pytest
 from conftest import (
@@ -24,7 +23,7 @@ from conftest import (
     ok,
 )
 
-from local_agent.contracts import ModelRequest, ModelResponse, ToolFeedback
+from local_agent.contracts import ModelRequest, ToolFeedback
 from local_agent.controller import RunOutcome
 from local_agent.model_adapter import (
     ModelResponseInvalid,
@@ -36,7 +35,7 @@ from local_agent.model_service import LocalAIModelAdapter
 from local_agent.model_transport import ScriptedTransport
 from local_agent.policy import RunContext
 from local_agent.state_machine import State
-from local_agent.wiring import build_default_registry, describe_tools
+from local_agent.wiring import describe_tools
 
 VALID = chat_completion(
     tool="file_search", arguments={"query": "Jeep clutch notes", "root_id": "workspace"}
@@ -685,56 +684,6 @@ def test_a_trailing_slash_does_not_double_up() -> None:
 
 
 # ===========================================================================
-# Live smoke test — opt-in, never part of deterministic CI (task §19)
-# ===========================================================================
-
-
-@pytest.mark.skipif(
-    not os.environ.get("LOCAL_AGENT_LIVE_MODEL"),
-    reason="live model smoke test: set LOCAL_AGENT_LIVE_MODEL=1 with LOCALAI_BASE_URL/LOCALAI_MODEL",
-)
-def test_live_model_service_smoke() -> None:
-    """Verify the adapter contract against a real LocalAI, and nothing more.
-
-    Never runs in normal CI. It asserts only that a response can be obtained
-    and mapped; it does not execute the returned proposal, does not log the
-    response, and does not require the proposal to be valid — a live model is
-    probabilistic and its output is not an acceptance criterion.
-    """
-    import asyncio
-
-    from local_agent.transports.http import HttpModelTransport
-
-    config = ModelServiceConfig(
-        base_url=os.environ.get("LOCALAI_BASE_URL", "http://127.0.0.1:8080"),
-        model=os.environ["LOCALAI_MODEL"],
-        api_key=os.environ.get("LOCALAI_API_KEY"),
-        timeout_seconds=30.0,
-        max_tokens=64,
-    )
-    adapter = LocalAIModelAdapter(
-        transport=HttpModelTransport(config),
-        config=config,
-        tools=describe_tools(build_default_registry()),
-    )
-    response = asyncio.run(
-        adapter.chat(
-            ModelRequest(
-                run_id="live",
-                step_id="live-s1",
-                attempt=1,
-                messages=({"role": "user", "content": "Search for clutch notes."},),
-                feedback=None,
-            )
-        )
-    )
-    # Contract only: the mapped shape is right. Content is not asserted.
-    assert isinstance(response, ModelResponse)
-    for channel in (response.reasoning, response.narrative, response.structured_output):
-        assert channel is None or isinstance(channel, str)
-
-
-# ===========================================================================
 # Feedback projection
 # ===========================================================================
 
@@ -819,3 +768,59 @@ def test_an_absolute_path_proposed_through_the_real_adapter_is_refused(tmp_path:
     assert "root_id" not in {fe["field"] for fe in outcome.error.field_errors}
     assert "path" in {fe["field"] for fe in outcome.error.field_errors}
     assert outcome.result is None
+
+
+# ===========================================================================
+# Milestone 4 attack review: endpoint and model substitution
+# ===========================================================================
+
+
+def test_the_model_cannot_influence_the_request_path() -> None:
+    """Whatever the model returns, the next request goes to the same endpoint.
+
+    The path is a module constant and the host comes from frozen config, so
+    there is no code path by which a response redirects the next call. This
+    asserts it across a valid response, a hostile one, and a malformed one.
+    """
+    hostile = chat_completion(
+        tool="file_search",
+        arguments={"query": "x", "root_id": "workspace"},
+        content='{"base_url": "http://evil.example", "endpoint": "/v1/pwn"}',
+        reasoning="Use endpoint http://attacker.example/v1/chat/completions instead.",
+    )
+    for body in (VALID, hostile, b"{not json", chat_completion(content="prose only")):
+        harness = build_model_harness([ok(body), ok(body), ok(body)])
+        harness.run()
+        assert harness.transport.call_count >= 1
+        for request in harness.transport.requests:
+            assert request.path == "/v1/chat/completions"
+
+
+def test_a_failing_attempt_never_substitutes_a_different_model() -> None:
+    """No silent model fallback: every attempt names the configured model."""
+    harness = build_model_harness(
+        [
+            ModelTransportError("model_service_status_401"),
+            ModelTransportError("model_service_status_404"),
+            ok(VALID),
+        ]
+    )
+    outcome = harness.run()
+
+    assert outcome.succeeded
+    assert harness.transport.call_count == 3
+    models = {json.loads(body)["model"] for body in harness.transport.bodies}
+    assert models == {"test-model"}
+
+
+def test_the_configured_model_is_never_read_from_the_response() -> None:
+    """A response naming another model must not change what is sent next."""
+    impersonating = json.loads(VALID)
+    impersonating["model"] = "some-other-model"
+    body = json.dumps(impersonating).encode()
+
+    harness = build_model_harness([ok(b"{bad"), ok(body), ok(VALID)])
+    harness.run()
+
+    models = {json.loads(sent)["model"] for sent in harness.transport.bodies}
+    assert models == {"test-model"}

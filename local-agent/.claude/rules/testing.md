@@ -38,6 +38,8 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
 | `test_filesystem.py` | the read-only capability: traversal, symlinks, containment, ceilings, sanitization |
 | `test_model_adapter.py` | the model boundary: transport failures, injection, request security, config |
 | `test_http_transport.py` | the network-granted module, against a loopback stdlib server |
+| `test_live_boundary.py` | the gate itself: skip without it, fail with it and no service |
+| `test_live_localai.py` | opt-in live scenarios; skipped unless `LOCAL_AGENT_LIVE_MODEL` is set |
 | `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem and model scenario |
 | `test_controller_flow.py` | gate ordering, audit events, budget arithmetic |
 | `test_architecture.py` | the capability boundary, enforced against the package AST |
@@ -64,13 +66,20 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
    outside-root one must fail; an authorized root must work *and* an
    unauthorized one must fail. A test suite that only proves things are refused
    cannot tell a working capability from a broken one.
-7. **The deterministic suite never needs a server.** No test may require a
+7. **The live gate decides skip versus fail, and both directions are tested.**
+   Gate absent → SKIP. Gate present but misconfigured or unreachable → FAIL.
+   Turning an explicitly requested live run into a silent skip is the failure
+   mode `test_live_boundary.py` exists to catch; never "simplify" it away.
+8. **Never weaken TLS to make a test pass.** The scan in
+   `test_architecture.py` covers tests as well as `src/` precisely because
+   that is where a bypass would be hidden.
+9. **The deterministic suite never needs a server.** No test may require a
    running LocalAI, network access beyond loopback, credentials, a GPU, or a
    model download. A live smoke test is allowed only behind an environment
    variable, and must never gate CI.
-8. **Say "deterministic controller behavior under controlled model responses",
+10. **Say "deterministic controller behavior under controlled model responses",
    not "deterministic".** A real model is probabilistic. The determinism under
    test belongs to the control plane, not to generation.
-9. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
+11. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
    `mypy`) pass before a change is done. CI runs the same ones in the same
    order.

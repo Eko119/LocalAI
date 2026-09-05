@@ -7,7 +7,8 @@ Work here from `local-agent/`, not the repository root.
 Human and machine readers alike: the specification of record is the reference
 package, summarised in [`docs/milestone-1-decisions.md`](docs/milestone-1-decisions.md)
 [`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md), and
-[`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md). Where this
+[`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md), and
+[`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md). Where this
 file and that package disagree, the package wins, and the disagreement should be
 written down rather than resolved silently.
 
@@ -23,8 +24,15 @@ those, it is wrong regardless of how well it works.
 
 ## Current milestone
 
-Milestones 1 (deterministic control plane), 2 (read-only filesystem) and
-3 (production model adapter) are complete and gated by CI.
+Milestones 1 (deterministic control plane), 2 (read-only filesystem),
+3 (production model adapter) and 4 (live integration hardening) are complete
+and gated by CI.
+
+**Milestone 4 is hardened but not yet observed live.** No LocalAI instance was
+reachable where it was written, so the four live scenarios are implemented and
+their skip/fail semantics verified, but no live exchange has been seen. Do not
+describe the live path as proven until someone runs `pytest -m live` against a
+real instance. See `docs/milestone-4-decisions.md` §1 and §8.
 
 **In scope:** state machine, typed contracts, tool registry, authorization,
 policy, retry budget, parser boundary, audit events, the `workspace.read` /
@@ -45,6 +53,14 @@ in `MODULE_IMPORT_GRANTS` in the architecture test and are mirrored in
 `.claude/hooks/milestone_scope_guard.py`; keep the two in step. Never widen the
 global allowlist to solve a one-module need — a global widening is exactly how
 the controller would quietly acquire filesystem or network access later.
+
+**Live tests are opt-in, and the gate is a boundary.** Absent gate → SKIP.
+Gate present but unusable → FAIL, never a silent skip. `pytest -q` must keep
+working with LocalAI entirely offline, and CI must never depend on it.
+
+**Never weaken TLS to make a test pass.** No `verify=False`, no unverified
+context, no CA-bundle environment fiddling — in `src/` or in tests. A
+self-signed instance is a deployment problem to solve, not a check to disable.
 
 **The model is a proposal engine, never an authority.** A real adapter changes
 nothing about that. Prose arrives on channels the parser never reads; a
@@ -92,6 +108,9 @@ commands CI runs, in the same order.
         http.py         sole holder of a network grant
     tests/              unit, adversarial, authority, filesystem, model,
                         transport, determinism, architecture
+      live_support.py   env conventions + gate semantics (test layer only)
+      test_live_localai.py     opt-in live scenarios (marked `live`)
+      test_live_boundary.py    deterministic proof of the gate semantics
 
 ## A note on enforcement
 
