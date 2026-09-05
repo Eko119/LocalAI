@@ -36,7 +36,9 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
 | `test_adversarial.py` | the 20 required hostile-input cases |
 | `test_authority.py` | the architecture invariants (model cannot execute, authorize, retry more, …) |
 | `test_filesystem.py` | the read-only capability: traversal, symlinks, containment, ceilings, sanitization |
-| `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem scenario, identical traces |
+| `test_model_adapter.py` | the model boundary: transport failures, injection, request security, config |
+| `test_http_transport.py` | the network-granted module, against a loopback stdlib server |
+| `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem and model scenario |
 | `test_controller_flow.py` | gate ordering, audit events, budget arithmetic |
 | `test_architecture.py` | the capability boundary, enforced against the package AST |
 
@@ -62,6 +64,13 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
    outside-root one must fail; an authorized root must work *and* an
    unauthorized one must fail. A test suite that only proves things are refused
    cannot tell a working capability from a broken one.
-7. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
+7. **The deterministic suite never needs a server.** No test may require a
+   running LocalAI, network access beyond loopback, credentials, a GPU, or a
+   model download. A live smoke test is allowed only behind an environment
+   variable, and must never gate CI.
+8. **Say "deterministic controller behavior under controlled model responses",
+   not "deterministic".** A real model is probabilistic. The determinism under
+   test belongs to the control plane, not to generation.
+9. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
    `mypy`) pass before a change is done. CI runs the same ones in the same
    order.

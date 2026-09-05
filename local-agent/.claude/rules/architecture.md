@@ -34,6 +34,9 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
 | which physical directory a root id means | `wiring.build_physical_roots` | anything the model sent |
 | whether a resolved path is inside its root | `workspace_fs._resolve_within_root` | a string prefix test |
 | filesystem resource ceilings | `policy.FilesystemLimits` | a tool argument |
+| where the model service lives | `model_config.ModelServiceConfig` | model output, ever |
+| model timeout and response ceilings | `model_config.ModelServiceConfig` | the model, or a tool argument |
+| which response channel may be parsed | `controller.parse_candidate` | the adapter |
 
 ## Rules
 
@@ -54,10 +57,11 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
    `ToolSpec` — same argument schema, same result schema — so swapping it is a
    wiring change, not a controller change.
 7. **Physical capability is granted per module, never globally.**
-   `executors/workspace_fs.py` holds the only filesystem grant. To give another
-   module one, add it to `MODULE_IMPORT_GRANTS` deliberately and say why — never
-   widen `ALLOWED_IMPORTS`, which would grant it to the controller and the
-   policy gates too.
+   `executors/workspace_fs.py` holds the only filesystem grant and
+   `transports/http.py` the only network grant. To give another module one, add
+   it to `MODULE_IMPORT_GRANTS` deliberately and say why — never widen
+   `ALLOWED_IMPORTS`, which would grant it to the controller and the policy
+   gates too.
 8. **Capabilities are named, not parameterised.** There is no
    `filesystem.operation(name, path)` seam. Adding a dangerous operation must
    require a new class, a new schema, a new registry entry, and new tests —
@@ -66,3 +70,11 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
    containment can only be established after physical resolution. It is
    fail-closed by construction: an executor cannot hand itself authority it
    was not wired with.
+10. **The adapter transports; the controller interprets.** A model adapter maps
+    wire fields onto the three channels and stops. It must not validate a
+    proposal, resolve a tool, decide retryability, or recover a missing
+    structured output from narrative — and it must never grow a second parser
+    beside `parse_candidate`.
+11. **Retry lives in one place.** Neither an adapter nor a transport may retry.
+    A transport retrying three times inside a controller retrying three times
+    makes nine calls against a budget of three, invisibly.

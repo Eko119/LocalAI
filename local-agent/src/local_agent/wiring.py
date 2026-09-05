@@ -20,8 +20,13 @@ from .executors.workspace_fs import (
     build_workspace_list_spec,
     build_workspace_read_spec,
 )
+from .model_adapter import ModelAdapter
+from .model_config import ModelServiceConfig
+from .model_service import LocalAIModelAdapter, ToolDescription
+from .model_transport import ModelTransport
 from .policy import DEFAULT_FILESYSTEM_LIMITS, LEGAL_ROOT_IDS, FilesystemLimits, RunContext
 from .registry import ToolExecutor, ToolRegistry
+from .transports.http import HttpModelTransport
 
 
 def build_default_registry(
@@ -87,4 +92,56 @@ def build_filesystem_run_context(
         authorized_tools=frozenset({"workspace.read", "workspace.list"}),
         authorized_roots=authorized_roots,
         filesystem=limits,
+    )
+
+
+# What the model is told each tool is for. Kept here, in trusted wiring, rather
+# than on `ToolSpec`: these strings are written for the model to read, and
+# nothing in the controller consults them.
+TOOL_DESCRIPTIONS: dict[str, str] = {
+    "workspace.read": "Read UTF-8 text from a file in an authorized root.",
+    "workspace.list": "List the entries of a directory in an authorized root.",
+    "file_search": "Search for files matching a query in an authorized root.",
+}
+
+
+def describe_tools(registry: ToolRegistry) -> tuple[ToolDescription, ...]:
+    """Project the registry onto the deliberately model-visible surface.
+
+    The model learns each tool's name and argument schema — enough to form a
+    well-shaped proposal — and nothing else. It does not learn which executor
+    backs a tool, which physical directory a root id resolves to, what the
+    policy ceilings are, or whether this run is authorized to use the tool at
+    all. Authorization is answered later, by the gates, on the proposal itself.
+
+    The `ToolRegistry` object never reaches the adapter; only this frozen
+    description does.
+    """
+    return tuple(
+        ToolDescription(
+            name=name,
+            description=TOOL_DESCRIPTIONS.get(name, ""),
+            parameters=spec.args_schema.model_json_schema(),
+        )
+        for name in sorted(registry.names)
+        if (spec := registry.get(name)) is not None
+    )
+
+
+def build_model_adapter(
+    config: ModelServiceConfig,
+    registry: ToolRegistry,
+    transport: ModelTransport | None = None,
+) -> ModelAdapter:
+    """Assemble the production model adapter.
+
+    `transport` exists so tests can substitute a deterministic in-process
+    double while keeping the production adapter byte-for-byte; it is not a
+    runtime configuration surface. Left unset, the adapter talks to the
+    configured LocalAI service over HTTP.
+    """
+    return LocalAIModelAdapter(
+        transport=transport or HttpModelTransport(config),
+        config=config,
+        tools=describe_tools(registry),
     )

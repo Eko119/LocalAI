@@ -81,6 +81,10 @@ FORBIDDEN_IMPORTS = frozenset(
 # catch. Adding a module to this map should be a deliberate, reviewed act.
 MODULE_IMPORT_GRANTS: dict[str, frozenset[str]] = {
     "workspace_fs.py": frozenset({"pathlib"}),
+    # Milestone 3 opened network access to exactly one module. `asyncio` rides
+    # along because the stdlib HTTP client is blocking and the round trip is
+    # moved onto a worker thread; it is not itself a network capability.
+    "http.py": frozenset({"urllib", "asyncio"}),
 }
 
 # Modules that must never touch a filesystem, whatever else changes. Listed
@@ -100,6 +104,49 @@ FILESYSTEM_FREE_MODULES = frozenset(
 )
 
 FILESYSTEM_MODULES = frozenset({"pathlib", "os", "shutil", "glob", "tempfile", "io", "fileinput"})
+
+# Anything that can open a socket, directly or indirectly.
+NETWORK_MODULES = frozenset(
+    {
+        "urllib",
+        "socket",
+        "ssl",
+        "http",
+        "ftplib",
+        "smtplib",
+        "telnetlib",
+        "requests",
+        "httpx",
+        "aiohttp",
+        "websockets",
+        "grpc",
+    }
+)
+
+# Modules that must never reach the network, whatever else changes. The model
+# adapter is on this list deliberately: it builds and interprets payloads, and
+# the socket belongs one layer below it, in the transport.
+NETWORK_FREE_MODULES = frozenset(
+    {
+        "controller.py",
+        "policy.py",
+        "state_machine.py",
+        "contracts.py",
+        "registry.py",
+        "events.py",
+        "model_adapter.py",
+        "model_transport.py",
+        "model_service.py",
+        "model_config.py",
+        "wiring.py",
+        "file_search.py",
+        "workspace_fs.py",
+    }
+)
+
+# Modules that legitimately deal in URLs. Everywhere else, a URL literal in
+# production code means someone hard-coded an endpoint.
+URL_BEARING_MODULES = frozenset({"model_config.py", "http.py"})
 
 
 def _production_modules() -> list[pathlib.Path]:
@@ -138,6 +185,93 @@ def test_imports_stay_within_the_allowlist(path: pathlib.Path) -> None:
     roots = _imported_roots(ast.parse(path.read_text()))
     allowed = ALLOWED_IMPORTS | _grant(path)
     assert roots <= allowed, f"{path.name} imports {roots - allowed}"
+
+
+@pytest.mark.parametrize("name", sorted(NETWORK_FREE_MODULES))
+def test_the_control_plane_cannot_touch_the_network(name: str) -> None:
+    """Network access is one module's capability, not the control plane's.
+
+    The controller decides whether a proposal executes; the transport speaks
+    to the model service. Keeping the socket out of every module on this list
+    means an adapter, a gate, or the state machine cannot quietly acquire a
+    second channel to the outside world.
+    """
+    matches = [path for path in _production_modules() if path.name == name]
+    assert matches, f"{name} is missing — update NETWORK_FREE_MODULES deliberately"
+    for path in matches:
+        roots = _imported_roots(ast.parse(path.read_text()))
+        assert not roots & NETWORK_MODULES, f"{name} imports {roots & NETWORK_MODULES}"
+
+
+def test_only_the_http_transport_holds_a_network_grant() -> None:
+    """Exactly one module may reach the network, and this is its name."""
+    granted = {name for name, grant in MODULE_IMPORT_GRANTS.items() if grant & NETWORK_MODULES}
+    assert granted == {"http.py"}
+
+    holders = [
+        path.name
+        for path in _production_modules()
+        if _imported_roots(ast.parse(path.read_text())) & NETWORK_MODULES
+    ]
+    assert holders == ["http.py"]
+
+
+def test_the_model_layer_cannot_touch_a_filesystem() -> None:
+    """A model adapter has no business reading files, and structurally cannot."""
+    for name in (
+        "model_adapter.py",
+        "model_service.py",
+        "model_transport.py",
+        "model_config.py",
+        "http.py",
+    ):
+        matches = [path for path in _production_modules() if path.name == name]
+        assert matches, f"{name} is missing"
+        roots = _imported_roots(ast.parse(matches[0].read_text()))
+        assert not roots & FILESYSTEM_MODULES, f"{name} imports {roots & FILESYSTEM_MODULES}"
+
+
+def test_the_transport_cannot_reach_the_controller_authority_objects() -> None:
+    """The transport sees bytes. It must not import the controller's authority.
+
+    A transport that could import `RunContext`, the registry, or the state
+    machine would be one refactor away from consulting or mutating them.
+    """
+    path = SRC / "transports" / "http.py"
+    tree = ast.parse(path.read_text())
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[-1])
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[-1] for alias in node.names)
+
+    for forbidden in ("controller", "policy", "registry", "state_machine", "wiring", "contracts"):
+        assert forbidden not in imported, f"transport imports {forbidden}"
+
+
+def test_the_model_layer_cannot_mutate_controller_authority() -> None:
+    """No model-layer module may construct or write controller authority objects.
+
+    `RunContext` and `ToolRegistry` are frozen and mutation-free respectively,
+    so this is belt and braces — but it catches the attempt at the point a
+    developer writes it, rather than at the point it would have failed.
+    """
+    authority_names = {"RunContext", "ToolRegistry", "ToolSpec", "Run", "State", "TRANSITIONS"}
+    for name in (
+        "model_adapter.py",
+        "model_service.py",
+        "model_transport.py",
+        "model_config.py",
+        "http.py",
+    ):
+        matches = [path for path in _production_modules() if path.name == name]
+        assert matches, f"{name} is missing"
+        tree = ast.parse(matches[0].read_text())
+        referenced = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        assert not referenced & authority_names, (
+            f"{name} references controller authority {referenced & authority_names}"
+        )
 
 
 @pytest.mark.parametrize("name", sorted(FILESYSTEM_FREE_MODULES))
@@ -280,6 +414,11 @@ def test_no_module_references_a_model_runtime_or_vendor_api() -> None:
     for path in _production_modules():
         code = _code_without_docstrings(path)
         for token in banned:
+            if token in {"http://", "https://"} and path.name in URL_BEARING_MODULES:
+                # The config validates URL schemes and the transport builds a
+                # request URL; naming the scheme there is the job, not a
+                # hard-coded endpoint. Neither module names a vendor runtime.
+                continue
             assert token not in code, f"{path.name} references {token}"
 
 

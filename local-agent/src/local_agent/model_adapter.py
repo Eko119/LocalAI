@@ -19,6 +19,51 @@ from typing import Protocol, runtime_checkable
 from .contracts import ModelRequest, ModelResponse
 
 
+class ModelAdapterError(RuntimeError):
+    """Base for expected, normalized failures of the model boundary.
+
+    These mirror the executor exceptions in `registry.py`: the controller
+    catches them and turns each into one of the eight existing
+    `ControllerError` codes. No new code was added to that protocol.
+
+    `reason` is a controller-private slug for the audit stream. It must never
+    carry a URL, a host, a header, a credential, or an upstream exception
+    message; the exception's own message is never forwarded to the model.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class ModelTransportTimeout(ModelAdapterError):
+    """The model service did not answer within the configured timeout.
+
+    Normalized to `EXECUTION_TIMEOUT` — retryable, and bounded by the
+    controller's existing attempt budget. The adapter never retries on its
+    own; see `docs/milestone-3-decisions.md` on why a transport-level retry
+    would silently multiply the controller's budget.
+    """
+
+
+class ModelTransportError(ModelAdapterError):
+    """The model service could not be reached, or answered with an error status.
+
+    Normalized to `EXECUTION_FAILED` — retryable and bounded.
+    """
+
+
+class ModelResponseInvalid(ModelAdapterError):
+    """The model service answered, but the answer was not usable.
+
+    Malformed JSON, a body that violates the response schema, an oversized
+    body, or an oversized structured output. Normalized to
+    `VERIFICATION_FAILED` — the same code the controller already uses when a
+    tool result fails its declared schema, for the same reason: something
+    downstream returned a shape we cannot trust.
+    """
+
+
 @runtime_checkable
 class ModelAdapter(Protocol):
     """Narrow interface: text in, untrusted candidate text out."""

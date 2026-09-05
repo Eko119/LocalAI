@@ -36,7 +36,12 @@ from .contracts import (
     ToolFeedback,
 )
 from .events import Event, EventRecorder
-from .model_adapter import ModelAdapter
+from .model_adapter import (
+    ModelAdapter,
+    ModelResponseInvalid,
+    ModelTransportError,
+    ModelTransportTimeout,
+)
 from .policy import RunContext, authorize, evaluate_policy
 from .registry import ToolDenialError, ToolExecutionError, ToolRegistry, ToolSpec
 from .state_machine import Run, State
@@ -52,6 +57,9 @@ _SCHEMA_MESSAGE = "Tool arguments failed schema validation."
 _TIMEOUT_MESSAGE = "The tool call exceeded its execution time budget."
 _EXECUTION_MESSAGE = "The tool could not complete the request."
 _VERIFICATION_MESSAGE = "The tool returned a result that failed verification."
+_MODEL_TIMEOUT_MESSAGE = "The model service did not respond in time."
+_MODEL_UNAVAILABLE_MESSAGE = "The model service could not be reached."
+_MODEL_RESPONSE_MESSAGE = "The model service returned an unusable response."
 
 
 class _Rejection(Exception):
@@ -174,7 +182,20 @@ class Controller:
                     messages=tuple(messages),
                     feedback=feedback,
                 )
-                response = await self._adapter.chat(request)
+                try:
+                    response = await self._adapter.chat(request)
+                except ModelTransportTimeout as exc:
+                    recorder.record("model_call_failed", attempt=attempt, reason=exc.reason)
+                    raise _Rejection("EXECUTION_TIMEOUT", _MODEL_TIMEOUT_MESSAGE) from exc
+                except ModelTransportError as exc:
+                    recorder.record("model_call_failed", attempt=attempt, reason=exc.reason)
+                    raise _Rejection("EXECUTION_FAILED", _MODEL_UNAVAILABLE_MESSAGE) from exc
+                except ModelResponseInvalid as exc:
+                    recorder.record("model_call_failed", attempt=attempt, reason=exc.reason)
+                    raise _Rejection("VERIFICATION_FAILED", _MODEL_RESPONSE_MESSAGE) from exc
+                # Any other exception from an adapter is a programmer error and
+                # propagates on purpose, exactly as it does for an executor.
+
                 recorder.record(
                     "model_output_received",
                     attempt=attempt,

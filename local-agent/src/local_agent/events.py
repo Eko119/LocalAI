@@ -26,6 +26,7 @@ EventType = Literal[
     "run_created",
     "state_entered",
     "model_output_received",
+    "model_call_failed",
     "candidate_parsed",
     "schema_rejected",
     "tool_not_found",

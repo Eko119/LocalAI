@@ -56,6 +56,7 @@ GUARDED_PATH = re.compile(r"local-agent/src/local_agent/.*\.py$")
 # never by widening the global rule. Keep the two in step.
 MODULE_GRANTS = {
     "workspace_fs.py": {"pathlib"},
+    "http.py": {"urllib"},
 }
 
 

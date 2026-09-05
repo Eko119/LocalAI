@@ -6,7 +6,8 @@ Work here from `local-agent/`, not the repository root.
 
 Human and machine readers alike: the specification of record is the reference
 package, summarised in [`docs/milestone-1-decisions.md`](docs/milestone-1-decisions.md)
-and [`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md). Where this
+[`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md), and
+[`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md). Where this
 file and that package disagree, the package wins, and the disagreement should be
 written down rather than resolved silently.
 
@@ -22,12 +23,13 @@ those, it is wrong regardless of how well it works.
 
 ## Current milestone
 
-Milestone 1 (deterministic control plane) and Milestone 2 (read-only filesystem
-capability) are both complete and gated by CI.
+Milestones 1 (deterministic control plane), 2 (read-only filesystem) and
+3 (production model adapter) are complete and gated by CI.
 
 **In scope:** state machine, typed contracts, tool registry, authorization,
-policy, retry budget, parser boundary, fake model adapter, audit events, the
-`workspace.read` / `workspace.list` capability, and tests.
+policy, retry budget, parser boundary, audit events, the `workspace.read` /
+`workspace.list` capability, the LocalAI model adapter and its transport, and
+tests.
 
 **Explicitly out of scope until a later milestone opens it:** writes of any
 kind, shell or subprocess execution, Playwright or any browser, network access,
@@ -36,12 +38,18 @@ OS-level sandboxing. `tests/test_architecture.py` enforces this by parsing the
 package's own AST — adding `import subprocess` fails the suite, it does not
 merely violate a convention.
 
-**The filesystem grant is per module.** `executors/workspace_fs.py` is the only
-production file allowed to import `pathlib` or touch a disk. That grant lives in
-`MODULE_IMPORT_GRANTS` in the architecture test and is mirrored in
+**Capability grants are per module.** `executors/workspace_fs.py` is the only
+production file allowed to import `pathlib` or touch a disk, and
+`transports/http.py` is the only one allowed a network import. Both grants live
+in `MODULE_IMPORT_GRANTS` in the architecture test and are mirrored in
 `.claude/hooks/milestone_scope_guard.py`; keep the two in step. Never widen the
 global allowlist to solve a one-module need — a global widening is exactly how
-the controller would quietly acquire filesystem access later.
+the controller would quietly acquire filesystem or network access later.
+
+**The model is a proposal engine, never an authority.** A real adapter changes
+nothing about that. Prose arrives on channels the parser never reads; a
+proposal from the channel it does read still passes validation, authorization,
+and policy. Never add a fallback that recovers a proposal from narrative.
 
 ## Rules
 
@@ -74,11 +82,16 @@ commands CI runs, in the same order.
       model_adapter.py  ModelAdapter protocol + deterministic fake
       events.py         structured audit records
       wiring.py         trusted startup assembly
+      model_config.py   frozen, validated model-service configuration
+      model_transport.py transport seam + deterministic scripted transport
+      model_service.py  production LocalAI adapter (OpenAI-compatible)
       executors/
         file_search.py  Milestone 1 deterministic fake
-        workspace_fs.py read-only filesystem — the sole holder of a disk grant
-    tests/              unit, adversarial, authority, filesystem, determinism,
-                        architecture
+        workspace_fs.py read-only filesystem — sole holder of a disk grant
+      transports/
+        http.py         sole holder of a network grant
+    tests/              unit, adversarial, authority, filesystem, model,
+                        transport, determinism, architecture
 
 ## A note on enforcement
 

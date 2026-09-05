@@ -81,6 +81,29 @@ perform the operations they authorize.
 - **Ceilings reject, never truncate.** A shortened file or listing cannot be
   distinguished from a complete one by whoever reads it next.
 
+## The model boundary
+
+- **Only the structured-generation channel is eligible.** LocalAI's
+  `message.tool_calls` becomes `structured_output`; `message.reasoning` and
+  `message.content` are carried but never parsed. Never add a fallback that
+  recovers a proposal from narrative when the tool-call channel is missing —
+  fail closed instead.
+- **Credentials never cross the transport seam.** `TransportRequest` carries a
+  path and a body. The API key lives inside the transport, which injects the
+  header itself, which is why a scripted transport can record every request
+  verbatim and a test can assert no secret appears.
+- **The API key is `repr=False`.** A dataclass repr would print it into any log
+  line that rendered the config. Keep it that way, and keep the sentinel test.
+- **Transport failures are translated at the point of catch.** `URLError` and
+  `HTTPError` messages routinely carry the host and upstream detail; never
+  forward one. Emit a stable slug for the audit stream instead.
+- **The retry budget is not transmitted.** The adapter projects `ToolFeedback`
+  onto `{type, tool, accepted, error:{code, message, field_errors}}`. Adding
+  `attempt` or `max_attempts` back to the wire is a regression.
+- **URLs are validated at construction**, restricted to `http`/`https`, and may
+  not embed credentials. This is a client for one configured model service, not
+  a general fetcher.
+
 ## Audit
 
 Events record structural facts only: state names, tool names, error codes,

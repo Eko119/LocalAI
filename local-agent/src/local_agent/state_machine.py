@@ -44,16 +44,19 @@ class State(Enum):
 #   RECEIVE -> CLASSIFY -> GENERATE -> PARSE -> VALIDATE -> AUTHORIZE
 #   -> POLICY_CHECK -> EXECUTE -> VERIFY -> RESPOND -> TERMINAL
 #
-# EXECUTE reaches FEEDBACK only when the executor raised and so produced no
-# result to verify; a completed execution always goes through VERIFY.
-# Any rejection at PARSE/VALIDATE/AUTHORIZE/POLICY_CHECK/EXECUTE/VERIFY routes to
+# GENERATE reaches FEEDBACK only when the model call itself failed — the
+# service timed out, was unreachable, or answered unusably — so there is no
+# generation to parse. EXECUTE reaches FEEDBACK only when the executor raised
+# and so produced no result to verify; a completed execution always goes
+# through VERIFY.
+# Any rejection at GENERATE/PARSE/VALIDATE/AUTHORIZE/POLICY_CHECK/EXECUTE/VERIFY routes to
 # FEEDBACK, which then either loops back to GENERATE via RETRY (budget
 # remaining) or ends the run at TERMINAL (exhausted or non-retryable).
 # TERMINAL has no outgoing edges: once entered, a run is over.
 TRANSITIONS: dict[State, frozenset[State]] = {
     State.RECEIVE: frozenset({State.CLASSIFY}),
     State.CLASSIFY: frozenset({State.GENERATE}),
-    State.GENERATE: frozenset({State.PARSE}),
+    State.GENERATE: frozenset({State.PARSE, State.FEEDBACK}),
     State.PARSE: frozenset({State.VALIDATE, State.FEEDBACK}),
     State.VALIDATE: frozenset({State.AUTHORIZE, State.FEEDBACK}),
     State.AUTHORIZE: frozenset({State.POLICY_CHECK, State.FEEDBACK}),

@@ -1,4 +1,4 @@
-# Local AI Agent — Deterministic Controller with Read-Only Filesystem
+# Local AI Agent — Deterministic Controller, Filesystem, and Model Adapter
 
 A deterministic control plane that treats an LLM as an untrusted proposal
 engine. The model may suggest a tool call; nothing else about the model's
@@ -164,9 +164,56 @@ module's own AST.
 | Reaching the other root through a symlink | `root_id` selects the root; the path cannot re-select it |
 | A file larger than the ceiling | At most ceiling+1 bytes are ever read; the request is denied, not truncated |
 | Instructions inside a file's contents | Returned as data; nothing re-reads a result as control input |
+| A tool call written in model prose | Prose arrives on a channel the parser never reads |
+| A model service returning 500 MB | At most ceiling+1 bytes are ever read |
+| A model service that hangs | Every call has an explicit, configured timeout |
+| Malformed or hostile service responses | Schema-validated at the boundary, normalized to existing error codes |
+| A model claiming it is authorized | Claims are prose; the gates re-decide every proposal independently |
 
 Each row has a test, and each rejection test also asserts the executor's call
 count is zero.
+
+## Talking to a real model
+
+The production adapter speaks LocalAI's OpenAI-compatible
+`POST /v1/chat/completions`. It gains no authority: it transports untrusted
+output, and every gate above still decides what happens to it.
+
+```python
+from local_agent.controller import Controller
+from local_agent.model_config import ModelServiceConfig
+from local_agent.wiring import build_default_registry, build_model_adapter
+
+config = ModelServiceConfig(base_url="http://127.0.0.1:8080", model="gemma-4-12b")
+registry = build_default_registry()
+controller = Controller(registry, build_model_adapter(config, registry))
+```
+
+**Three channels, one of them eligible.** LocalAI's response message carries
+`reasoning`, `content`, and `tool_calls` separately, and they map onto this
+project's three channels unchanged. Only `tool_calls` becomes
+`structured_output`; prose can never become a proposal, because prose arrives
+on a field the parser does not read. If the tool-call channel is missing,
+empty, or ambiguous, the adapter fails closed — it never recovers a proposal
+from narrative and never infers one from prose.
+
+**Configuration is operator authority.** Base URL, credential, timeout, and
+every ceiling live in a frozen, validated `ModelServiceConfig`. The URL is
+restricted to `http`/`https`, may not embed credentials, and the API key is
+`repr=False` so a stray log line cannot print it. The model supplies none of
+these.
+
+**One socket, one module.** `transports/http.py` is the only production module
+permitted a network import, granted per module exactly as the filesystem grant
+was — the controller, the gates, and even the model adapter itself remain
+structurally unable to open a connection.
+
+**Retry stays where it was.** The adapter and transport never retry. Three
+controller attempts mean exactly three model calls; a transport retrying inside
+a retrying controller would silently make nine.
+
+**Zero new dependencies** — the transport is stdlib `urllib.request` on a
+worker thread.
 
 ## Layout
 
@@ -179,16 +226,22 @@ count is zero.
       model_adapter.py  ModelAdapter protocol + deterministic fake
       events.py         structured audit records (no secrets, no wall clock)
       wiring.py         trusted startup assembly
+      model_config.py   frozen, validated model-service configuration
+      model_transport.py the transport seam + deterministic scripted transport
+      model_service.py  the production LocalAI adapter
       executors/
         file_search.py  the Milestone 1 deterministic fake
         workspace_fs.py the only module permitted to touch a filesystem
+      transports/
+        http.py         the only module permitted to touch the network
 
 ## Scope
 
 **Implemented:** deterministic controller, state machine, model adapter
 interface, tool specification, `ControllerError`, `ToolFeedback`, typed result
-boundary, authorization, policy, retry budget, parser boundary, fake model
-adapter, audit events, a read-only filesystem capability, and the test suite.
+boundary, authorization, policy, retry budget, parser boundary, audit events, a
+read-only filesystem capability, a production model adapter over LocalAI's
+OpenAI-compatible endpoint, and the test suite.
 
 **Deliberately absent:** writes of any kind, shell or subprocess execution,
 Playwright or any browser, network access, MCP, Docker code execution, Qdrant,
@@ -201,4 +254,5 @@ merely stated.
 
 - [`docs/milestone-1-decisions.md`](docs/milestone-1-decisions.md) — controller conflicts, resolutions, deviations
 - [`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md) — filesystem path model, symlink policy, ceilings, and known limitations
+- [`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md) — model API selection, channel mapping, transport boundary, and what determinism does and does not mean here
 - [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/) — working rules for this subproject

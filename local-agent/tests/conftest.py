@@ -26,12 +26,16 @@ from local_agent.executors.workspace_fs import (
     WorkspaceReadExecutor,
 )
 from local_agent.model_adapter import ScriptedModelAdapter
+from local_agent.model_config import ModelServiceConfig
+from local_agent.model_service import LocalAIModelAdapter
+from local_agent.model_transport import ScriptedTransport, TransportResponse
 from local_agent.policy import DEFAULT_FILESYSTEM_LIMITS, FilesystemLimits, RunContext
 from local_agent.wiring import (
     build_default_registry,
     build_filesystem_registry,
     build_filesystem_run_context,
     build_physical_roots,
+    describe_tools,
 )
 
 
@@ -315,3 +319,109 @@ def fs_spy(monkeypatch: pytest.MonkeyPatch) -> FilesystemSpy:
     monkeypatch.setattr(Path, "open", recording_open)
     monkeypatch.setattr(Path, "iterdir", recording_iterdir)
     return spy
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3: model-adapter fixtures
+# ---------------------------------------------------------------------------
+#
+# The deterministic suite never touches a network. Every model-adapter test
+# drives the production `LocalAIModelAdapter` over a `ScriptedTransport`, so
+# the code under test is the real one and only the socket is replaced.
+
+SENTINEL_API_KEY = "sk-do-not-leak-4f3a9c"
+
+
+def model_config(**overrides: Any) -> ModelServiceConfig:
+    """A valid config carrying a sentinel credential, for leak assertions."""
+    settings: dict[str, Any] = {
+        "base_url": "http://127.0.0.1:8080",
+        "model": "test-model",
+        "api_key": SENTINEL_API_KEY,
+        "timeout_seconds": 5.0,
+    }
+    settings.update(overrides)
+    return ModelServiceConfig(**settings)
+
+
+def chat_completion(
+    *,
+    tool: str | None = None,
+    arguments: Any = None,
+    raw_arguments: str | None = None,
+    content: Any = None,
+    reasoning: str | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+) -> bytes:
+    """Build a LocalAI-shaped chat-completions body.
+
+    Mirrors `core/schema/message.go`: a choice carries a message with separate
+    `content`, `reasoning`, and `tool_calls` fields.
+    """
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning is not None:
+        message["reasoning"] = reasoning
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
+    elif tool is not None:
+        serialized = raw_arguments if raw_arguments is not None else json.dumps(arguments or {})
+        message["tool_calls"] = [
+            {
+                "index": 0,
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": tool, "arguments": serialized},
+            }
+        ]
+    body = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "test-model",
+        "choices": [{"index": 0, "finish_reason": "stop", "message": message}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+    return json.dumps(body).encode("utf-8")
+
+
+def ok(body: bytes) -> TransportResponse:
+    return TransportResponse(status=200, body=body)
+
+
+@dataclass
+class ModelHarness:
+    """A controller driven by the production adapter over a scripted transport."""
+
+    transport: ScriptedTransport
+    adapter: LocalAIModelAdapter
+    controller: Controller
+    run_context: RunContext
+    executor: FakeFileSearchExecutor
+
+    def run(self) -> RunOutcome:
+        return asyncio.run(
+            self.controller.run(self.run_context, [{"role": "user", "content": "find my notes"}])
+        )
+
+
+def build_model_harness(
+    outcomes: Sequence[TransportResponse | BaseException] | TransportResponse | BaseException,
+    config: ModelServiceConfig | None = None,
+    run_context: RunContext | None = None,
+) -> ModelHarness:
+    if isinstance(outcomes, TransportResponse | BaseException):
+        outcomes = (outcomes,)
+    resolved = config or model_config()
+    executor = FakeFileSearchExecutor()
+    registry = build_default_registry(executor)
+    transport = ScriptedTransport(tuple(outcomes))
+    adapter = LocalAIModelAdapter(
+        transport=transport, config=resolved, tools=describe_tools(registry)
+    )
+    return ModelHarness(
+        transport=transport,
+        adapter=adapter,
+        controller=Controller(registry, adapter),
+        run_context=run_context or RunContext(run_id="run-model"),
+        executor=executor,
+    )
