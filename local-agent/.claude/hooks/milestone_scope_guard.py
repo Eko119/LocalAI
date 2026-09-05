@@ -20,7 +20,7 @@ import json
 import re
 import sys
 
-# Capabilities Milestone 1 must not acquire (task hard-scope list).
+# Capabilities no module acquires without an explicit per-module grant below.
 FORBIDDEN_IMPORTS = re.compile(
     r"^\s*(?:import|from)\s+"
     r"(os|sys|subprocess|shutil|pathlib|glob|tempfile|socket|ssl|http|urllib|"
@@ -44,24 +44,36 @@ FORBIDDEN_COMMANDS = [
     ),
     (
         re.compile(r"\b(huggingface-cli|hf)\s+download\b|\bwget\b.*\.gguf|\bcurl\b.*\.gguf"),
-        "Model downloads are out of scope for Milestone 1.",
+        "Model downloads are out of scope.",
     ),
 ]
 
 # Only guard the agent subproject's production package.
 GUARDED_PATH = re.compile(r"local-agent/src/local_agent/.*\.py$")
 
-# Milestone 2 granted filesystem access to exactly one module. The grant is
-# expressed here the same way it is in tests/test_architecture.py: per module,
-# never by widening the global rule. Keep the two in step.
+# Capability grants are per module, expressed here exactly as they are in
+# `MODULE_IMPORT_GRANTS` in tests/test_architecture.py: never by widening the
+# global rule. Keep the two in step — the test is the enforcement, this is the
+# early warning, and a grant present in only one of them is a drift bug.
+#
+#   workspace_fs.py  Milestone 2: the only reader of a workspace
+#   http.py          Milestone 3: the only network client (`asyncio` rides
+#                    along because the stdlib client is blocking)
+#   journal.py       Milestone 5: the only writer of durable state (`fcntl`
+#                    is the advisory lock that stops two live recoveries)
+#
+# `persistence/records.py` needs no entry: its `hashlib` and `uuid` imports are
+# not capabilities and are not on the forbidden list. The architecture test
+# grants them explicitly because it checks a stricter allowlist.
 MODULE_GRANTS = {
     "workspace_fs.py": {"pathlib"},
     "http.py": {"urllib"},
+    "journal.py": {"os", "pathlib"},
 }
 
 
 def _block(reason: str) -> None:
-    print(f"Milestone 1 scope guard: {reason}", file=sys.stderr)
+    print(f"Milestone scope guard: {reason}", file=sys.stderr)
     print(
         "See local-agent/.claude/rules/architecture.md. If a later milestone is "
         "genuinely open, update the scope rules and tests first.",

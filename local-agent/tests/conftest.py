@@ -29,6 +29,7 @@ from local_agent.model_adapter import ScriptedModelAdapter
 from local_agent.model_config import ModelServiceConfig
 from local_agent.model_service import LocalAIModelAdapter
 from local_agent.model_transport import ScriptedTransport, TransportResponse
+from local_agent.persistence.journal import RunJournal
 from local_agent.policy import DEFAULT_FILESYSTEM_LIMITS, FilesystemLimits, RunContext
 from local_agent.wiring import (
     build_default_registry,
@@ -425,3 +426,66 @@ def build_model_harness(
         run_context=run_context or RunContext(run_id="run-model"),
         executor=executor,
     )
+
+
+# ---------------------------------------------------------------------------
+# Milestone 5: durable state, crash simulation, recovery
+# ---------------------------------------------------------------------------
+
+
+class SimulatedCrash(BaseException):
+    """Stands in for process death at a precise persistence boundary.
+
+    Deliberately a `BaseException`: a crash is not something the controller
+    may catch and recover from in-process, and inheriting from `Exception`
+    would let an over-broad handler quietly swallow it and hide the very bug
+    these tests exist to find. No sleeps and no timing are involved — the
+    crash point is chosen structurally, so every crash test is deterministic.
+    """
+
+
+class CrashingJournal(RunJournal):
+    """A journal that dies at a named record boundary.
+
+    `crash_before` dies without persisting the record; `crash_after` persists
+    it durably and then dies. Between them they express every crash window
+    that surrounds a durable write.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        crash_before: str | None = None,
+        crash_after: str | None = None,
+    ) -> None:
+        super().__init__(path)
+        self._crash_before = crash_before
+        self._crash_after = crash_after
+        self.appended: list[str] = []
+
+    def append(self, record: Any) -> int:
+        if self._crash_before is not None and record.type == self._crash_before:
+            raise SimulatedCrash(f"before:{record.type}")
+        seq = super().append(record)
+        self.appended.append(record.type)
+        if self._crash_after is not None and record.type == self._crash_after:
+            raise SimulatedCrash(f"after:{record.type}")
+        return seq
+
+
+class CrashingExecutor(RecordingExecutor):
+    """Performs the physical call, then dies before returning.
+
+    This is crash window C: the side effect has happened, but the controller
+    never learned that it did.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        super().__init__()
+        self._inner = inner
+
+    def execute(self, args: Any) -> Any:
+        self.calls.append(args)
+        self._inner.execute(args)
+        raise SimulatedCrash("during:execution")

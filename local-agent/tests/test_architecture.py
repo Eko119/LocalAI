@@ -85,6 +85,13 @@ MODULE_IMPORT_GRANTS: dict[str, frozenset[str]] = {
     # along because the stdlib HTTP client is blocking and the round trip is
     # moved onto a worker thread; it is not itself a network capability.
     "http.py": frozenset({"urllib", "asyncio"}),
+    # Milestone 5 opened durable storage to exactly one module. `fcntl` is the
+    # advisory lock that stops two live recoveries of the same run.
+    "journal.py": frozenset({"os", "fcntl", "pathlib"}),
+    # Hashing for content-addressed execution identity and record integrity,
+    # and `uuid` for run identity. Neither is a capability: no I/O, no
+    # network, no ambient state — `uuid4` reads the OS random source only.
+    "records.py": frozenset({"hashlib", "uuid"}),
 }
 
 # Modules that must never touch a filesystem, whatever else changes. Listed
@@ -103,7 +110,15 @@ FILESYSTEM_FREE_MODULES = frozenset(
     }
 )
 
-FILESYSTEM_MODULES = frozenset({"pathlib", "os", "shutil", "glob", "tempfile", "io", "fileinput"})
+FILESYSTEM_MODULES = frozenset(
+    {"pathlib", "os", "shutil", "glob", "tempfile", "io", "fileinput", "fcntl"}
+)
+
+# The two modules allowed to touch a filesystem, and why each one is.
+# They are different capabilities that happen to share a syscall surface:
+# one resolves a *model-requested* path under an authorized root, the
+# other writes *controller-owned* state to an operator-configured file.
+FILESYSTEM_GRANT_HOLDERS = frozenset({"workspace_fs.py", "journal.py"})
 
 # Anything that can open a socket, directly or indirectly.
 NETWORK_MODULES = frozenset(
@@ -141,6 +156,9 @@ NETWORK_FREE_MODULES = frozenset(
         "wiring.py",
         "file_search.py",
         "workspace_fs.py",
+        "records.py",
+        "journal.py",
+        "recovery.py",
     }
 )
 
@@ -289,17 +307,17 @@ def test_the_control_plane_cannot_touch_a_filesystem(name: str) -> None:
         assert not roots & FILESYSTEM_MODULES, f"{name} imports {roots & FILESYSTEM_MODULES}"
 
 
-def test_only_the_filesystem_executor_holds_a_filesystem_grant() -> None:
-    """Exactly one module may reach a filesystem, and this is its name."""
+def test_only_the_declared_modules_hold_a_filesystem_grant() -> None:
+    """Filesystem access is confined to two named modules, and no others."""
     granted = {name for name, grant in MODULE_IMPORT_GRANTS.items() if grant & FILESYSTEM_MODULES}
-    assert granted == {"workspace_fs.py"}
+    assert granted == set(FILESYSTEM_GRANT_HOLDERS)
 
-    holders = [
+    holders = {
         path.name
         for path in _production_modules()
         if _imported_roots(ast.parse(path.read_text())) & FILESYSTEM_MODULES
-    ]
-    assert holders == ["workspace_fs.py"]
+    }
+    assert holders == set(FILESYSTEM_GRANT_HOLDERS)
 
 
 def test_the_filesystem_executor_exposes_no_mutation_primitive() -> None:
@@ -680,3 +698,130 @@ def test_invariant_deterministic_replay_never_touches_live_inference() -> None:
     assert "HttpModelTransport" not in text
     assert "os.environ" not in text
     assert "ScriptedTransport" in text or "build_model_harness" in text
+
+
+# ===========================================================================
+# Milestone 5: persistence ownership
+# ===========================================================================
+#
+# Persistence is a controller-side capability. The model layer must not be
+# able to reach it, tools must not be able to mutate it, and the durable
+# store must not acquire a second capability of its own.
+
+PERSISTENCE_MODULES = frozenset({"records.py", "journal.py", "recovery.py"})
+
+MODEL_LAYER_MODULES = frozenset(
+    {"model_adapter.py", "model_service.py", "model_transport.py", "model_config.py", "http.py"}
+)
+
+
+def _intra_package_imports(path: pathlib.Path) -> set[str]:
+    """Module names imported from within this package, relative or absolute."""
+    tree = ast.parse(path.read_text())
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            names.update(node.module.split("."))
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[-1] for alias in node.names)
+    return names
+
+
+@pytest.mark.parametrize("name", sorted(MODEL_LAYER_MODULES))
+def test_the_model_layer_cannot_reach_persistence(name: str) -> None:
+    """A model adapter must not be able to read or write durable state.
+
+    The model proposes; the controller decides and records. If the adapter
+    could touch the journal, model-adjacent code would sit on the same side
+    of the boundary as the controller's own memory of what it authorized.
+    """
+    matches = [path for path in _production_modules() if path.name == name]
+    assert matches, f"{name} is missing"
+    imported = _intra_package_imports(matches[0])
+    for forbidden in ("persistence", "journal", "records", "recovery"):
+        assert forbidden not in imported, f"{name} imports {forbidden}"
+
+
+@pytest.mark.parametrize("name", ["file_search.py", "workspace_fs.py"])
+def test_tools_cannot_reach_persistence(name: str) -> None:
+    """An executor must not be able to write the record of its own execution."""
+    matches = [path for path in _production_modules() if path.name == name]
+    assert matches, f"{name} is missing"
+    imported = _intra_package_imports(matches[0])
+    for forbidden in ("persistence", "journal", "records", "recovery"):
+        assert forbidden not in imported, f"{name} imports {forbidden}"
+
+
+@pytest.mark.parametrize("name", ["records.py", "journal.py"])
+def test_the_durable_store_holds_no_controller_authority(name: str) -> None:
+    """The store serializes bytes; it does not decide anything."""
+    matches = [path for path in _production_modules() if path.name == name]
+    assert matches, f"{name} is missing"
+    imported = _intra_package_imports(matches[0])
+    for forbidden in ("controller", "policy", "registry", "state_machine", "wiring"):
+        assert forbidden not in imported, f"{name} imports {forbidden}"
+
+
+def test_persistence_never_reaches_the_model_or_the_network() -> None:
+    for name in sorted(PERSISTENCE_MODULES):
+        matches = [path for path in _production_modules() if path.name == name]
+        assert matches, f"{name} is missing"
+        roots = _imported_roots(ast.parse(matches[0].read_text()))
+        assert not roots & NETWORK_MODULES, f"{name} reaches the network"
+        imported = _intra_package_imports(matches[0])
+        for forbidden in ("model_adapter", "model_service", "model_transport", "model_config"):
+            assert forbidden not in imported, f"{name} imports {forbidden}"
+
+
+def test_recovery_reads_no_environment_and_opens_no_file() -> None:
+    """Recovery is pure: records in, a plan out. It cannot go looking."""
+    path = SRC / "recovery.py"
+    roots = _imported_roots(ast.parse(path.read_text()))
+    assert not roots & FILESYSTEM_MODULES
+    assert not roots & NETWORK_MODULES
+    assert "os.environ" not in path.read_text()
+
+
+def test_the_persistence_boundary_check_actually_catches_a_violation() -> None:
+    """Adversarial: a model module that imported the journal must be caught."""
+    poisoned = (
+        "from .persistence.journal import RunJournal\n" + (SRC / "model_service.py").read_text()
+    )
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        candidate = pathlib.Path(directory) / "model_service.py"
+        candidate.write_text(poisoned)
+        assert "journal" in _intra_package_imports(candidate)
+
+    # And the real module is clean, so the check is not trivially true.
+    assert "journal" not in _intra_package_imports(SRC / "model_service.py")
+
+
+def test_only_the_journal_writes_durable_state() -> None:
+    """Exactly one module opens a file for writing or forces it to disk.
+
+    Read-only opens are not writes: `workspace_fs.py` legitimately opens files
+    in mode "rb", which `test_the_filesystem_executor_only_opens_for_reading`
+    pins separately. What this asserts is narrower and is the property that
+    matters for durable state — only the journal can create or extend it.
+    """
+    writers: list[str] = []
+    for path in _production_modules():
+        tree = ast.parse(path.read_text())
+        writes = False
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            attribute = node.func.attr
+            if attribute in {"write_text", "write_bytes", "fsync", "truncate"}:
+                writes = True
+            elif attribute == "open":
+                mode = node.args[0] if node.args else None
+                literal = mode.value if isinstance(mode, ast.Constant) else ""
+                if not isinstance(literal, str) or any(flag in literal for flag in "wa+"):
+                    writes = True
+        if writes:
+            writers.append(path.name)
+    assert writers == ["journal.py"]

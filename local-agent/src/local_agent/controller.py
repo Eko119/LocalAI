@@ -42,6 +42,15 @@ from .model_adapter import (
     ModelTransportError,
     ModelTransportTimeout,
 )
+from .persistence.journal import RunJournal
+from .persistence.records import (
+    DurableRecord,
+    ExecutionAuthorized,
+    ExecutionCompleted,
+    RunStarted,
+    RunTerminal,
+    derive_execution_id,
+)
 from .policy import RunContext, authorize, evaluate_policy
 from .registry import ToolDenialError, ToolExecutionError, ToolRegistry, ToolSpec
 from .state_machine import Run, State
@@ -148,9 +157,18 @@ class RunOutcome:
 class Controller:
     """Owns the run. Constructed by trusted wiring, never by model output."""
 
-    def __init__(self, registry: ToolRegistry, adapter: ModelAdapter) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        adapter: ModelAdapter,
+        journal: RunJournal | None = None,
+    ) -> None:
         self._registry = registry
         self._adapter = adapter
+        # Optional by design: a run without a journal behaves exactly as it did
+        # before Milestone 5, which is why every existing test still passes
+        # unchanged. A run *with* one becomes recoverable.
+        self._journal = journal
 
     async def run(
         self,
@@ -160,6 +178,7 @@ class Controller:
         recorder = EventRecorder(run_context.run_id)
         machine = Run()
         recorder.record("run_created", max_attempts=run_context.max_attempts)
+        self._persist(RunStarted(run_id=run_context.run_id, max_attempts=run_context.max_attempts))
         recorder.record("state_entered", state=State.RECEIVE.value)
 
         self._enter(machine, recorder, State.CLASSIFY)
@@ -219,7 +238,51 @@ class Controller:
                 self._policy(spec, args, run_context, recorder)
 
                 self._enter(machine, recorder, State.EXECUTE)
-                raw_result = self._execute(spec, args, tool_call_id, attempt, recorder)
+                # WRITE-AHEAD BOUNDARY. The authorization is durable before
+                # the executor is invoked, so a crash *during* execution is
+                # detectable: the journal then holds an authorization with no
+                # matching completion. Without this ordering the ambiguous
+                # window would be silent rather than merely ambiguous.
+                execution_id = derive_execution_id(
+                    run_context.run_id,
+                    step_id,
+                    attempt,
+                    spec.name,
+                    args.model_dump(mode="json"),
+                )
+                self._persist(
+                    ExecutionAuthorized(
+                        run_id=run_context.run_id,
+                        step_id=step_id,
+                        attempt=attempt,
+                        tool=spec.name,
+                        arguments=args.model_dump(mode="json"),
+                        execution_id=execution_id,
+                        side_effect_free=spec.side_effect_free,
+                    )
+                )
+                try:
+                    raw_result = self._execute(spec, args, tool_call_id, attempt, recorder)
+                except _Rejection as rejection:
+                    # The executor ran and failed. Recording completion closes
+                    # the ambiguity window: recovery knows the physical call
+                    # finished, even though it finished badly.
+                    self._persist(
+                        ExecutionCompleted(
+                            run_id=run_context.run_id,
+                            execution_id=execution_id,
+                            status="failed",
+                            reason=rejection.code,
+                        )
+                    )
+                    raise
+                self._persist(
+                    ExecutionCompleted(
+                        run_id=run_context.run_id,
+                        execution_id=execution_id,
+                        status="succeeded",
+                    )
+                )
 
                 self._enter(machine, recorder, State.VERIFY)
                 result = self._verify(spec, raw_result, recorder)
@@ -253,6 +316,14 @@ class Controller:
                 terminal_code: ErrorCode = "RETRY_EXHAUSTED" if error.retryable else error.code
                 self._enter(machine, recorder, State.TERMINAL)
                 recorder.record("terminal", status="failed", code=terminal_code, attempts=attempt)
+                self._persist(
+                    RunTerminal(
+                        run_id=run_context.run_id,
+                        status="failed",
+                        code=terminal_code,
+                        attempts=attempt,
+                    )
+                )
                 return RunOutcome(
                     terminal=ControllerTerminal(
                         status="failed", code=terminal_code, attempts=attempt
@@ -266,6 +337,9 @@ class Controller:
             self._enter(machine, recorder, State.RESPOND)
             self._enter(machine, recorder, State.TERMINAL)
             recorder.record("terminal", status="succeeded", attempts=attempt)
+            self._persist(
+                RunTerminal(run_id=run_context.run_id, status="succeeded", attempts=attempt)
+            )
             return RunOutcome(
                 terminal=ControllerTerminal(status="succeeded", code=None, attempts=attempt),
                 states=tuple(machine.history),
@@ -275,6 +349,15 @@ class Controller:
             )
 
     # -- individual gates -------------------------------------------------
+
+    def _persist(self, record: DurableRecord) -> None:
+        """Durably record one controller fact, when this run has a journal.
+
+        A no-op without one. Persistence is something a run is wired with, not
+        a dependency the controller cannot operate without.
+        """
+        if self._journal is not None:
+            self._journal.append(record)
 
     def _enter(self, machine: Run, recorder: EventRecorder, state: State) -> None:
         machine.advance(state)

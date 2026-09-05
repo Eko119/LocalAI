@@ -53,11 +53,12 @@ it is that no shell executor exists to route it to. Keep it that way. The
 forbidden-import allowlist in `tests/test_architecture.py` is the enforcement;
 widening it requires opening the corresponding milestone first.
 
-Filesystem access is granted to exactly one module,
-`executors/workspace_fs.py`, via `MODULE_IMPORT_GRANTS`. Never satisfy a
-one-module need by widening the global allowlist: that would hand the same
-capability to the controller and the policy gates, which must remain unable to
-perform the operations they authorize.
+Filesystem access is granted per module via `MODULE_IMPORT_GRANTS`:
+`executors/workspace_fs.py` may read a workspace, and
+`persistence/journal.py` may write the journal — neither can do the other's
+job. Never satisfy a one-module need by widening the global allowlist: that
+would hand the same capability to the controller and the policy gates, which
+must remain unable to perform the operations they authorize.
 
 ## The filesystem boundary
 
@@ -103,6 +104,40 @@ perform the operations they authorize.
 - **URLs are validated at construction**, restricted to `http`/`https`, and may
   not embed credentials. This is a client for one configured model service, not
   a general fetcher.
+
+## The persistence boundary
+
+- **The journal is a record, not an authority.** Recovery re-validates every
+  record against the live registry and the live `RunContext`: the run id, the
+  budget, the tool's existence, its argument schema, the re-derived execution
+  id, and `side_effect_free`. A disagreement is a fatal `RecoveryError`. Never
+  add a path that repairs a record, and never take a decision *from* a file.
+- **Identity is derived, never carried.** An execution id is
+  `sha256(run_id, step_id, attempt, tool, canonical arguments)`. A record whose
+  stored id does not re-derive from its own contents is rejected, so an
+  attacker cannot rename an execution into one that looks already-completed.
+- **The checksum detects corruption, not tampering.** There is no key to
+  authenticate with, so it must never be treated as a signature. The
+  adversarial tests deliberately recompute it after every mutation; what
+  actually defends the system is re-derivation against invariants the file
+  cannot influence. Do not describe the checksum as tamper protection.
+- **Fail closed on ambiguity.** A crash between authorization and completion is
+  `execution_unknown` for any tool not declared `side_effect_free`, and
+  `requires_operator` is True. Never resolve an unknown by assuming the
+  friendlier branch, and never default `side_effect_free` to True.
+- **Write the authorization before executing.** Durability must precede the
+  side effect, or a crash leaves an effect with no record of it at all.
+- **Replay must not be able to act.** `recovery.replay` takes no executor and
+  never reaches `ToolSpec.executor`. Keep it that way — reconstructing a run
+  from an untrusted journal must have nothing to trigger.
+- **Never persist:** credentials or headers, model reasoning, narrative, raw
+  prompts or responses, tool result payloads, physical filesystem paths, or
+  exception text. A completion carries a status and a stable reason slug. A
+  durable file outlives the process that wrote it, so a secret written there is
+  a secret leaked for as long as the file exists.
+- **Run ids are filenames.** They are constrained to
+  `^[A-Za-z0-9._-]{1,128}$` at the record boundary, which is what stops a run
+  id from becoming a path traversal. Do not loosen that pattern.
 
 ## Audit
 

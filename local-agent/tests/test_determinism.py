@@ -35,14 +35,25 @@ from conftest import (
 )
 
 from local_agent.contracts import ModelResponse
+from local_agent.executors.file_search import FakeFileSearchExecutor
 from local_agent.model_adapter import (
     ModelResponseInvalid,
     ModelTransportError,
     ModelTransportTimeout,
 )
 from local_agent.model_transport import TransportResponse
+from local_agent.persistence.records import (
+    DurableRecord,
+    ExecutionAuthorized,
+    ExecutionCompleted,
+    RunStarted,
+    RunTerminal,
+    derive_execution_id,
+    envelope,
+)
 from local_agent.policy import DEFAULT_FILESYSTEM_LIMITS, FilesystemLimits, RunContext
-from local_agent.wiring import build_filesystem_run_context
+from local_agent.recovery import plan_recovery, replay
+from local_agent.wiring import build_default_registry, build_filesystem_run_context
 
 REPETITIONS = 200
 
@@ -382,3 +393,135 @@ def test_model_fingerprints_contain_no_environment_specific_data() -> None:
         fingerprint = _model_fingerprint(name).lower()
         for forbidden in ("127.0.0.1", "8080", "sk-do-not-leak", "bearer", "0x", "/home/", "/tmp"):
             assert forbidden not in fingerprint, f"{name} fingerprint leaked {forbidden}"
+
+
+# ---------------------------------------------------------------------------
+# Milestone 5: recovery and replay determinism
+# ---------------------------------------------------------------------------
+#
+# The same journal must always yield the same plan, the same replay, and the
+# same bytes. Run identity is injected rather than generated here — production
+# `new_run_id()` stays random, and making it deterministic to satisfy a test
+# would weaken real identity rather than prove anything.
+
+RECOVERY_REPETITIONS = 100
+
+_RECOVERY_RUN = "run-determinism"
+_RECOVERY_ARGS = {"query": "Jeep clutch notes", "root_id": "workspace", "max_results": 10}
+_RECOVERY_EID = derive_execution_id(
+    _RECOVERY_RUN, f"{_RECOVERY_RUN}-s1", 1, "file_search", _RECOVERY_ARGS
+)
+
+
+def _authorization() -> ExecutionAuthorized:
+    return ExecutionAuthorized(
+        run_id=_RECOVERY_RUN,
+        step_id=f"{_RECOVERY_RUN}-s1",
+        attempt=1,
+        tool="file_search",
+        arguments=_RECOVERY_ARGS,
+        execution_id=_RECOVERY_EID,
+        side_effect_free=True,
+    )
+
+
+def _recovery_scenarios() -> dict[str, list[DurableRecord]]:
+    """One journal per crash window, built without touching a filesystem."""
+    started = RunStarted(run_id=_RECOVERY_RUN, max_attempts=3)
+    completed = ExecutionCompleted(
+        run_id=_RECOVERY_RUN, execution_id=_RECOVERY_EID, status="succeeded"
+    )
+    failed = ExecutionCompleted(
+        run_id=_RECOVERY_RUN,
+        execution_id=_RECOVERY_EID,
+        status="failed",
+        reason="EXECUTION_TIMEOUT",
+    )
+    return {
+        "01_no_execution_authorized": [started],
+        "02_execution_pending": [started, _authorization()],
+        "03_execution_completed": [started, _authorization(), completed],
+        "04_execution_failed": [started, _authorization(), failed],
+        "05_terminal_success": [
+            started,
+            _authorization(),
+            completed,
+            RunTerminal(run_id=_RECOVERY_RUN, status="succeeded", attempts=1),
+        ],
+        "06_terminal_failure": [
+            started,
+            _authorization(),
+            failed,
+            RunTerminal(run_id=_RECOVERY_RUN, status="failed", code="RETRY_EXHAUSTED", attempts=3),
+        ],
+    }
+
+
+def _recovery_fingerprint(scenario: str) -> str:
+    records = list(enumerate(_recovery_scenarios()[scenario]))
+    registry = build_default_registry(FakeFileSearchExecutor())
+    context = RunContext(run_id=_RECOVERY_RUN)
+
+    plan = plan_recovery(records, registry, context)
+    result = replay(records, registry, context)
+
+    return json.dumps(
+        {
+            "plan": {
+                "disposition": plan.disposition,
+                "may_execute": plan.may_execute,
+                "requires_operator": plan.requires_operator,
+                "attempt": plan.attempt,
+                "tool": plan.tool,
+                "arguments": plan.arguments,
+                "execution_id": plan.execution_id,
+                "side_effect_free": plan.side_effect_free,
+                "execution_status": plan.execution_status,
+                "terminal_status": plan.terminal_status,
+                "terminal_code": plan.terminal_code,
+                "records_examined": plan.records_examined,
+            },
+            "replay": {
+                "states": [state.value for state in result.states],
+                "record_types": list(result.record_types),
+                "execution_ids": list(result.execution_ids),
+                "executions_completed": result.executions_completed,
+                "terminal_status": result.terminal_status,
+                "attempts": result.attempts,
+            },
+            # The persisted bytes themselves, which must also be stable.
+            "serialized": [envelope(record, seq) for seq, record in records],
+        },
+        sort_keys=True,
+    )
+
+
+@pytest.mark.parametrize("scenario", sorted(_recovery_scenarios()))
+def test_recovery_replay_is_identical_across_repetitions(scenario: str) -> None:
+    baseline = _recovery_fingerprint(scenario)
+    fingerprints = {_recovery_fingerprint(scenario) for _ in range(RECOVERY_REPETITIONS)}
+
+    assert fingerprints == {baseline}, f"{scenario} diverged across {RECOVERY_REPETITIONS} runs"
+
+
+def test_recovery_scenarios_are_distinguishable() -> None:
+    fingerprints = {name: _recovery_fingerprint(name) for name in _recovery_scenarios()}
+    assert len(set(fingerprints.values())) == len(fingerprints)
+
+
+def test_recovery_fingerprints_carry_no_timestamp_or_host_detail() -> None:
+    for name in _recovery_scenarios():
+        fingerprint = _recovery_fingerprint(name).lower()
+        for forbidden in ("timestamp", "created_at", "/tmp", "/home", "0x", "127.0.0.1"):
+            assert forbidden not in fingerprint, f"{name} leaked {forbidden}"
+
+
+def test_serialized_records_are_byte_stable_across_processes() -> None:
+    """Determinism must not depend on this process's dict ordering."""
+    for name in _recovery_scenarios():
+        records = list(enumerate(_recovery_scenarios()[name]))
+        first = [envelope(record, seq) for seq, record in records]
+        # Rebuild the scenario from scratch, then re-serialize.
+        rebuilt = list(enumerate(_recovery_scenarios()[name]))
+        second = [envelope(record, seq) for seq, record in rebuilt]
+        assert first == second

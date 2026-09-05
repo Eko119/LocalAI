@@ -1,4 +1,4 @@
-# Local AI Agent — Deterministic Controller, Filesystem, and Model Adapter
+# Local AI Agent — Deterministic Controller, Filesystem, Model Adapter, Durable State
 
 A deterministic control plane that treats an LLM as an untrusted proposal
 engine. The model may suggest a tool call; nothing else about the model's
@@ -12,7 +12,10 @@ malformed or hostile output cannot obtain unauthorized execution authority.
 Milestone 2 gives the controller its first real external capability — read-only
 filesystem access — without giving the model any filesystem authority at all:
 it names an abstract root and a relative path, and never learns where either
-one physically is.
+one physically is. Milestone 5 makes controller state survive a crash without
+making the durable store an authority: a journal records what the controller
+decided, and everything read back is re-validated against live invariants
+before it is believed.
 
 ## The pipeline
 
@@ -169,6 +172,12 @@ module's own AST.
 | A model service that hangs | Every call has an explicit, configured timeout |
 | Malformed or hostile service responses | Schema-validated at the boundary, normalized to existing error codes |
 | A model claiming it is authorized | Claims are prose; the gates re-decide every proposal independently |
+| A journal edited to grant a different tool | Recovery re-resolves the tool against the live registry and re-derives the execution id |
+| A journal edited to widen the retry budget | The budget comes from the live `RunContext`; a disagreeing record is fatal |
+| A completion record with no authorization | Rejected as a forged result — the controller never approved that execution |
+| A record claiming an unknown type or schema version | Refused before Pydantic sees it; unknown is never "probably fine" |
+| A truncated final line after a crash | Never `fsync`-returned, so never durable; dropped, not guessed at |
+| Replaying a hostile journal to force a side effect | `replay` takes no executor and cannot reach one |
 
 Each row has a test, and each rejection test also asserts the executor's call
 count is zero.
@@ -255,6 +264,90 @@ requirement, not something the tests bypass.
 **Normal CI does not require LocalAI**, and PR mergeability does not depend on
 live inference.
 
+## Surviving a crash
+
+The controller can be given a journal. It then writes four kinds of record —
+run started, execution authorized, execution completed, run terminal — and
+each `append` returns only after `os.fsync`, so a record that was returned is
+a record that survived.
+
+```python
+from local_agent.persistence.journal import RunJournal
+from local_agent.persistence.records import new_run_id
+
+run_id = new_run_id()
+with RunJournal(f"/var/lib/local-agent/{run_id}.jsonl") as journal:
+    controller = Controller(registry, adapter, journal=journal)
+    outcome = asyncio.run(controller.run(RunContext(run_id=run_id), messages))
+```
+
+**The authorization is written before the executor is called**, not after.
+That ordering is the whole design: a crash can then leave an authorization
+with no completion, which is a *detectable* ambiguity, whereas writing
+afterwards would leave a completed side effect with no record of it at all.
+
+**Recovery re-decides; it does not resume.** `plan_recovery` reads the journal
+back and re-validates every record against the *live* registry and run
+context — the run id matches, the budget matches, the tool still exists, the
+arguments still validate against its current schema, the execution id
+re-derives from those arguments, and `side_effect_free` still matches the
+`ToolSpec`. Anything that disagrees is a fatal `RecoveryError`, never a
+repair. It returns a plan, and acting on that plan is a separate decision:
+
+```python
+from local_agent.persistence.journal import read_records
+from local_agent.recovery import plan_recovery, replay
+
+records = read_records(path)
+plan = plan_recovery(records, registry, RunContext(run_id=run_id))
+plan.disposition  # e.g. 'execution_unknown'
+plan.may_execute  # only for an authorized, uncompleted, repeatable tool
+plan.requires_operator  # True when the system cannot know what happened
+
+replay(records, registry, RunContext(run_id=run_id))  # observe, never execute
+```
+
+**Execution identity is content-addressed.** An execution id is
+`sha256(run_id, step_id, attempt, tool, canonical arguments)`, truncated to
+128 bits. It is derived, never carried from the model or read from the file:
+a journal claiming an id that its own contents do not produce is rejected.
+
+**Semantics, stated without hedging.** This system does **not** provide
+exactly-once execution in general, and does not use the phrase where it cannot
+enforce it. What it provides is:
+
+| Tool | Guarantee | On an ambiguous crash |
+|---|---|---|
+| `side_effect_free=True` | at-least-once, observationally equivalent to exactly-once *because the tool repeats harmlessly* | recovery may re-execute |
+| `side_effect_free=False` (the default) | at-most-once | `execution_unknown`, `requires_operator = True`, stop |
+
+The flag defaults to `False`, so a tool added without thinking about crash
+behaviour fails closed. It lives on the frozen `ToolSpec` in trusted wiring;
+nothing in a proposal can reach it.
+
+**Replay executes nothing.** `replay` takes no executor and never touches
+`ToolSpec.executor` — it reconstructs the observable shape of a run (state
+trace, record types, execution ids, terminal status) from the records alone,
+so a hostile journal has nothing to trigger. A test asserts this against the
+function's own AST as well as behaviourally.
+
+**The journal is a record, not an authority.** Its checksum detects
+corruption; it cannot detect tampering, because there is no key to
+authenticate with, and the adversarial tests recompute the checksum after
+every mutation to make that explicit. What actually defends the system is
+re-derivation and re-validation against invariants the file cannot influence.
+
+**What is never written:** credentials, headers, model reasoning or narrative,
+raw prompts or responses, tool result payloads, physical filesystem paths, and
+exception text. A completion carries a status and a stable reason slug, and
+nothing else.
+
+**One writer.** The journal takes an `fcntl.flock` on open; a second live
+holder is refused with `JournalLockError`. A lock is chosen over an exclusive
+lock file precisely because the kernel releases it when the process dies —
+a crashed run is immediately recoverable rather than blocked forever by a
+stale lock.
+
 ## Layout
 
     src/local_agent/
@@ -269,9 +362,13 @@ live inference.
       model_config.py   frozen, validated model-service configuration
       model_transport.py the transport seam + deterministic scripted transport
       model_service.py  the production LocalAI adapter
+      recovery.py       crash-recovery planning + observational replay (pure)
       executors/
         file_search.py  the Milestone 1 deterministic fake
         workspace_fs.py the only module permitted to touch a filesystem
+      persistence/
+        records.py      versioned durable record contracts (pure, no I/O)
+        journal.py      the only module permitted to write durable state
       transports/
         http.py         the only module permitted to touch the network
 
@@ -281,11 +378,14 @@ live inference.
 interface, tool specification, `ControllerError`, `ToolFeedback`, typed result
 boundary, authorization, policy, retry budget, parser boundary, audit events, a
 read-only filesystem capability, a production model adapter over LocalAI's
-OpenAI-compatible endpoint, and the test suite.
+OpenAI-compatible endpoint, a durable run journal with crash recovery and
+observational replay, and the test suite.
 
-**Deliberately absent:** writes of any kind, shell or subprocess execution,
-Playwright or any browser, network access, MCP, Docker code execution, Qdrant,
-SQLite persistence, Gemma, llama.cpp, and OS-level sandboxing.
+**Deliberately absent:** writes to a workspace, shell or subprocess execution,
+Playwright or any browser, network access outside the model transport, MCP,
+Docker code execution, Qdrant, SQLite, Gemma, llama.cpp, OS-level sandboxing,
+distributed coordination, and automatic resumption — recovery produces a
+*plan*, and acting on it is a separate decision this milestone does not make.
 `tests/test_architecture.py` enforces this against the package's own AST, with
 the filesystem grant scoped to one named module — the absence is checked, not
 merely stated.
@@ -295,4 +395,6 @@ merely stated.
 - [`docs/milestone-1-decisions.md`](docs/milestone-1-decisions.md) — controller conflicts, resolutions, deviations
 - [`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md) — filesystem path model, symlink policy, ceilings, and known limitations
 - [`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md) — model API selection, channel mapping, transport boundary, and what determinism does and does not mean here
+- [`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md) — live-integration gate semantics, credential handling, and what remains unobserved
+- [`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md) — durable state architecture, crash windows, execution semantics, and the proven/assumed/not-guaranteed split
 - [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/) — working rules for this subproject

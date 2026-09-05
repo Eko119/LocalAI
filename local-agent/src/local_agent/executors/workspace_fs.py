@@ -318,6 +318,9 @@ def build_workspace_read_spec(executor: ToolExecutor) -> ToolSpec:
         requires_authorization=True,
         destructive=False,
         result_schema=WorkspaceReadResult,
+        # Reads produce no side effect, so an ambiguous crash may be
+        # resolved by re-executing (see docs/milestone-5-decisions.md).
+        side_effect_free=True,
     )
 
 
@@ -331,4 +334,5 @@ def build_workspace_list_spec(executor: ToolExecutor) -> ToolSpec:
         requires_authorization=True,
         destructive=False,
         result_schema=WorkspaceListResult,
+        side_effect_free=True,
     )

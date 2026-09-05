@@ -40,7 +40,9 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
 | `test_http_transport.py` | the network-granted module, against a loopback stdlib server |
 | `test_live_boundary.py` | the gate itself: skip without it, fail with it and no service |
 | `test_live_localai.py` | opt-in live scenarios; skipped unless `LOCAL_AGENT_LIVE_MODEL` is set |
-| `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem and model scenario |
+| `test_persistence.py` | the durable boundary: round trip, identity derivation, fsync ordering, locking, ceilings, and the corruption matrix |
+| `test_recovery.py` | crash windows A–F with measured execution counts, the recovery matrix, adversarial journal mutations, and that replay executes nothing |
+| `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem, model, and recovery scenario |
 | `test_controller_flow.py` | gate ordering, audit events, budget arithmetic |
 | `test_architecture.py` | the capability boundary, enforced against the package AST |
 
@@ -80,6 +82,21 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
 10. **Say "deterministic controller behavior under controlled model responses",
    not "deterministic".** A real model is probabilistic. The determinism under
    test belongs to the control plane, not to generation.
-11. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
+11. **Crashes are simulated, never slept for.** A crash is a
+   `SimulatedCrash(BaseException)` raised at a chosen record boundary by
+   `CrashingJournal` or `CrashingExecutor`. `sleep()` would make the suite slow
+   and, worse, timing-dependent — the thing `test_determinism.py` exists to
+   forbid. It also derives from `BaseException` deliberately, so a stray
+   `except Exception` cannot swallow it and turn a crash test green.
+12. **An adversarial journal test recomputes the checksum.** Mutating a record
+   and leaving the old checksum only proves the checksum works. The interesting
+   attacker knows how to recompute it, so the test must too — that is what
+   forces the assertion onto re-derivation and re-validation, where the real
+   defence lives.
+13. **A crash-window test asserts the physical execution count.** Not just the
+   disposition: the question "did the side effect happen" is answered by
+   counting executor invocations, and a test that only checks the returned plan
+   would pass even if recovery had re-run a non-repeatable tool.
+14. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
    `mypy`) pass before a change is done. CI runs the same ones in the same
    order.

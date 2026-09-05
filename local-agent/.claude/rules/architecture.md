@@ -37,6 +37,9 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
 | where the model service lives | `model_config.ModelServiceConfig` | model output, ever |
 | model timeout and response ceilings | `model_config.ModelServiceConfig` | the model, or a tool argument |
 | which response channel may be parsed | `controller.parse_candidate` | the adapter |
+| what an execution is | `persistence.records.derive_execution_id` | an id read out of a file |
+| whether a crashed run may re-execute | `recovery.plan_recovery` + `ToolSpec.side_effect_free` | the journal's own claim |
+| whether repeating a tool is safe | trusted wiring, on the frozen `ToolSpec` | a proposal, a result, or a record |
 
 ## Rules
 
@@ -57,7 +60,8 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
    `ToolSpec` — same argument schema, same result schema — so swapping it is a
    wiring change, not a controller change.
 7. **Physical capability is granted per module, never globally.**
-   `executors/workspace_fs.py` holds the only filesystem grant and
+   `executors/workspace_fs.py` holds the only filesystem *read* grant,
+   `persistence/journal.py` the only durable *write* grant, and
    `transports/http.py` the only network grant. To give another module one, add
    it to `MODULE_IMPORT_GRANTS` deliberately and say why — never widen
    `ALLOWED_IMPORTS`, which would grant it to the controller and the policy
@@ -78,3 +82,16 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
 11. **Retry lives in one place.** Neither an adapter nor a transport may retry.
     A transport retrying three times inside a controller retrying three times
     makes nine calls against a budget of three, invisibly.
+12. **Persistence records; it never decides.** The journal is a durable
+    representation of controller-owned state, not a second source of truth.
+    Recovery re-validates every record against the live registry and the live
+    `RunContext` and treats disagreement as fatal. Never read a budget, a
+    grant, a tool identity, or a state transition *out of* the file, and never
+    add a repair path that "fixes" a record to make a run resumable.
+13. **Authorize durably, then execute.** The `ExecutionAuthorized` record is
+    written and `fsync`'d *before* the executor is called. Reversing that
+    ordering would trade a detectable ambiguity for an invisible one: a side
+    effect that happened with nothing on disk saying so.
+14. **Replay observes; it cannot act.** `recovery.replay` takes no executor and
+    must never reach `ToolSpec.executor`. Reconstructing a run is a read of
+    records, so an untrusted journal has nothing there to trigger.

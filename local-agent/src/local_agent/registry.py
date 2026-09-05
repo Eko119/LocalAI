@@ -91,6 +91,16 @@ class ToolSpec:
     requires_authorization: bool
     destructive: bool
     result_schema: type[BaseModel]
+    # Whether re-running this tool after an ambiguous crash adds no further
+    # effect. It exists for exactly one decision (Milestone 5): when a crash
+    # happens *during* execution, the journal cannot say whether the side
+    # effect occurred, and only this flag says whether re-executing is safe.
+    #
+    # The default is False — fail closed. A new tool is assumed unsafe to
+    # repeat until someone declares otherwise in wiring, and the model can
+    # never declare it: `ToolSpec` is frozen and built by trusted wiring, and
+    # nothing in a proposal reaches this field.
+    side_effect_free: bool = False
 
 
 class ToolRegistry:

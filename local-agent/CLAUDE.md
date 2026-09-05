@@ -6,9 +6,10 @@ Work here from `local-agent/`, not the repository root.
 
 Human and machine readers alike: the specification of record is the reference
 package, summarised in [`docs/milestone-1-decisions.md`](docs/milestone-1-decisions.md)
-[`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md), and
-[`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md), and
-[`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md). Where this
+[`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md),
+[`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md),
+[`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md), and
+[`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md). Where this
 file and that package disagree, the package wins, and the disagreement should be
 written down rather than resolved silently.
 
@@ -25,8 +26,8 @@ those, it is wrong regardless of how well it works.
 ## Current milestone
 
 Milestones 1 (deterministic control plane), 2 (read-only filesystem),
-3 (production model adapter) and 4 (live integration hardening) are complete
-and gated by CI.
+3 (production model adapter), 4 (live integration hardening) and 5 (durable
+run state and crash recovery) are complete and gated by CI.
 
 **Milestone 4 is hardened but not yet observed live.** No LocalAI instance was
 reachable where it was written, so the four live scenarios are implemented and
@@ -36,23 +37,32 @@ real instance. See `docs/milestone-4-decisions.md` §1 and §8.
 
 **In scope:** state machine, typed contracts, tool registry, authorization,
 policy, retry budget, parser boundary, audit events, the `workspace.read` /
-`workspace.list` capability, the LocalAI model adapter and its transport, and
-tests.
+`workspace.list` capability, the LocalAI model adapter and its transport, the
+durable run journal with its recovery and replay, and tests.
 
-**Explicitly out of scope until a later milestone opens it:** writes of any
-kind, shell or subprocess execution, Playwright or any browser, network access,
-MCP, Docker code execution, Qdrant, SQLite persistence, Gemma, llama.cpp, and
-OS-level sandboxing. `tests/test_architecture.py` enforces this by parsing the
-package's own AST — adding `import subprocess` fails the suite, it does not
-merely violate a convention.
+**Explicitly out of scope until a later milestone opens it:** writes to a
+workspace, shell or subprocess execution, Playwright or any browser, network
+access outside the model transport, MCP, Docker code execution, Qdrant, SQLite,
+Gemma, llama.cpp, OS-level sandboxing, distributed coordination, and automatic
+resumption of a recovered run. `tests/test_architecture.py` enforces this by
+parsing the package's own AST — adding `import subprocess` fails the suite, it
+does not merely violate a convention.
 
-**Capability grants are per module.** `executors/workspace_fs.py` is the only
-production file allowed to import `pathlib` or touch a disk, and
-`transports/http.py` is the only one allowed a network import. Both grants live
-in `MODULE_IMPORT_GRANTS` in the architecture test and are mirrored in
+**Capability grants are per module.** `executors/workspace_fs.py` and
+`persistence/journal.py` are the only production files allowed to touch a disk,
+and `transports/http.py` is the only one allowed a network import. All grants
+live in `MODULE_IMPORT_GRANTS` in the architecture test and are mirrored in
 `.claude/hooks/milestone_scope_guard.py`; keep the two in step. Never widen the
 global allowlist to solve a one-module need — a global widening is exactly how
 the controller would quietly acquire filesystem or network access later.
+
+**The durable store records; it never decides.** A journal is a representation
+of controller-owned state, not a second authority. Everything read back is
+re-validated against the *live* registry and `RunContext` before it is
+believed, and a record that disagrees is a fatal `RecoveryError`, never a
+repair. Never add a code path that takes a budget, a grant, a tool identity, or
+a state transition *from* the file — that is the exact shape of the mistake
+this milestone exists to avoid.
 
 **Live tests are opt-in, and the gate is a boundary.** Absent gate → SKIP.
 Gate present but unusable → FAIL, never a silent skip. `pytest -q` must keep
@@ -101,13 +111,18 @@ commands CI runs, in the same order.
       model_config.py   frozen, validated model-service configuration
       model_transport.py transport seam + deterministic scripted transport
       model_service.py  production LocalAI adapter (OpenAI-compatible)
+      recovery.py       crash-recovery planning + observational replay (pure)
       executors/
         file_search.py  Milestone 1 deterministic fake
-        workspace_fs.py read-only filesystem — sole holder of a disk grant
+        workspace_fs.py read-only filesystem — sole holder of a read grant
+      persistence/
+        records.py      versioned durable record contracts (pure, no I/O)
+        journal.py      append-only journal — sole holder of a write grant
       transports/
         http.py         sole holder of a network grant
     tests/              unit, adversarial, authority, filesystem, model,
-                        transport, determinism, architecture
+                        transport, persistence, recovery, determinism,
+                        architecture
       live_support.py   env conventions + gate semantics (test layer only)
       test_live_localai.py     opt-in live scenarios (marked `live`)
       test_live_boundary.py    deterministic proof of the gate semantics

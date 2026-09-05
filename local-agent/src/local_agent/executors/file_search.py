@@ -64,4 +64,7 @@ def build_file_search_spec(executor: ToolExecutor | None = None) -> ToolSpec:
         requires_authorization=True,
         destructive=False,
         result_schema=FileSearchResult,
+        # Reads produce no side effect, so an ambiguous crash may be
+        # resolved by re-executing (see docs/milestone-5-decisions.md).
+        side_effect_free=True,
     )
