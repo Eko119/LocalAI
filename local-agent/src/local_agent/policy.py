@@ -33,8 +33,48 @@ from pydantic import BaseModel
 
 from .registry import ToolSpec
 
-# The only root IDs that exist in Milestone 1 (spec §"authorization_and_policy").
+# The only root IDs that exist (spec §"authorization_and_policy"). These are
+# abstract labels. The physical directory each one maps to is chosen by
+# trusted wiring and never appears in this module.
 LEGAL_ROOT_IDS: frozenset[str] = frozenset({"workspace", "knowledge"})
+
+
+@dataclass(frozen=True)
+class FilesystemLimits:
+    """Resource ceilings for the read-only filesystem capability.
+
+    These are policy authority, not model input: no tool argument schema
+    exposes a byte count, an entry count, or a size. The same frozen object
+    is handed to the executor by trusted wiring, so the ceiling enforced
+    during a physical read is the ceiling policy declared — there is one
+    source of truth rather than two that can drift.
+
+    Ceilings are enforced by rejection, not truncation. A silently truncated
+    file or listing is indistinguishable from a complete one, which is a poor
+    property for data a model will reason over.
+    """
+
+    # Bytes, not characters. UTF-8 text can spend several bytes per character,
+    # so a character-based limit would not bound memory or transfer.
+    max_file_read_bytes: int = 262_144  # 256 KiB
+    max_directory_entries: int = 1_000
+    # May tighten, never widen, the schema's structural MAX_PATH_LENGTH.
+    max_path_length: int = 1_024
+    # Backstop on the serialized result handed back to the controller.
+    max_serialized_result_bytes: int = 524_288  # 512 KiB
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_file_read_bytes",
+            "max_directory_entries",
+            "max_path_length",
+            "max_serialized_result_bytes",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be >= 1")
+
+
+DEFAULT_FILESYSTEM_LIMITS = FilesystemLimits()
 
 
 @dataclass(frozen=True)
@@ -56,6 +96,9 @@ class RunContext:
     # the schema says what is *structurally* sayable (1..50), this says what
     # this particular run is *operationally* allowed to ask for.
     max_results_ceiling: int = 50
+    # Resource ceilings for the filesystem capability. Wiring passes this same
+    # object to the executors, so policy and physical enforcement agree.
+    filesystem: FilesystemLimits = DEFAULT_FILESYSTEM_LIMITS
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
@@ -106,5 +149,12 @@ def evaluate_policy(spec: ToolSpec, args: BaseModel, run: RunContext) -> Decisio
     max_results = getattr(args, "max_results", None)
     if isinstance(max_results, int) and max_results > run.max_results_ceiling:
         return Decision(False, "max_results_above_policy_ceiling")
+
+    # General rule, like the root check in `authorize`: any tool whose
+    # arguments carry a `path` is subject to this run's path-length ceiling.
+    # The schema already bounds it structurally; this lets a run tighten it.
+    path = getattr(args, "path", None)
+    if isinstance(path, str) and len(path) > run.filesystem.max_path_length:
+        return Decision(False, "path_above_policy_length_ceiling")
 
     return Decision(True)

@@ -18,7 +18,7 @@ import pytest
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "local_agent"
 
-# Everything Milestone 1 is permitted to import. Deliberately tiny: the
+# The base grant every production module holds. Deliberately tiny: the
 # controller needs JSON, dataclasses, typing, and pydantic. Nothing else.
 ALLOWED_IMPORTS = frozenset(
     {
@@ -71,8 +71,43 @@ FORBIDDEN_IMPORTS = frozenset(
 )
 
 
+# Milestone 2 opened exactly one capability, to exactly one module.
+#
+# `workspace_fs.py` is the only production file that may reach a filesystem,
+# so it is the only one granted `pathlib`. The grant is expressed per module
+# rather than by widening ALLOWED_IMPORTS, because a global widening would
+# silently let the controller, the policy gates, or the state machine acquire
+# filesystem access later — which is precisely the drift this test exists to
+# catch. Adding a module to this map should be a deliberate, reviewed act.
+MODULE_IMPORT_GRANTS: dict[str, frozenset[str]] = {
+    "workspace_fs.py": frozenset({"pathlib"}),
+}
+
+# Modules that must never touch a filesystem, whatever else changes. Listed
+# by name so that deleting one from the map is visible in review.
+FILESYSTEM_FREE_MODULES = frozenset(
+    {
+        "controller.py",
+        "policy.py",
+        "state_machine.py",
+        "contracts.py",
+        "registry.py",
+        "events.py",
+        "model_adapter.py",
+        "wiring.py",
+        "file_search.py",
+    }
+)
+
+FILESYSTEM_MODULES = frozenset({"pathlib", "os", "shutil", "glob", "tempfile", "io", "fileinput"})
+
+
 def _production_modules() -> list[pathlib.Path]:
     return sorted(SRC.rglob("*.py"))
+
+
+def _grant(path: pathlib.Path) -> frozenset[str]:
+    return MODULE_IMPORT_GRANTS.get(path.name, frozenset())
 
 
 def _imported_roots(tree: ast.AST) -> set[str]:
@@ -94,13 +129,104 @@ def test_the_package_has_production_modules_to_check() -> None:
 @pytest.mark.parametrize("path", _production_modules(), ids=lambda p: p.name)
 def test_no_module_imports_a_forbidden_capability(path: pathlib.Path) -> None:
     roots = _imported_roots(ast.parse(path.read_text()))
-    assert not roots & FORBIDDEN_IMPORTS, f"{path.name} imports {roots & FORBIDDEN_IMPORTS}"
+    forbidden = FORBIDDEN_IMPORTS - _grant(path)
+    assert not roots & forbidden, f"{path.name} imports {roots & forbidden}"
 
 
 @pytest.mark.parametrize("path", _production_modules(), ids=lambda p: p.name)
 def test_imports_stay_within_the_allowlist(path: pathlib.Path) -> None:
     roots = _imported_roots(ast.parse(path.read_text()))
-    assert roots <= ALLOWED_IMPORTS, f"{path.name} imports {roots - ALLOWED_IMPORTS}"
+    allowed = ALLOWED_IMPORTS | _grant(path)
+    assert roots <= allowed, f"{path.name} imports {roots - allowed}"
+
+
+@pytest.mark.parametrize("name", sorted(FILESYSTEM_FREE_MODULES))
+def test_the_control_plane_cannot_touch_a_filesystem(name: str) -> None:
+    """The controller and its gates must never acquire filesystem access.
+
+    This is the structural half of "the model never receives filesystem
+    authority": the components that make authorization decisions physically
+    cannot perform the operation they are authorizing.
+    """
+    matches = [path for path in _production_modules() if path.name == name]
+    assert matches, f"{name} is missing — update FILESYSTEM_FREE_MODULES deliberately"
+    for path in matches:
+        roots = _imported_roots(ast.parse(path.read_text()))
+        assert not roots & FILESYSTEM_MODULES, f"{name} imports {roots & FILESYSTEM_MODULES}"
+
+
+def test_only_the_filesystem_executor_holds_a_filesystem_grant() -> None:
+    """Exactly one module may reach a filesystem, and this is its name."""
+    granted = {name for name, grant in MODULE_IMPORT_GRANTS.items() if grant & FILESYSTEM_MODULES}
+    assert granted == {"workspace_fs.py"}
+
+    holders = [
+        path.name
+        for path in _production_modules()
+        if _imported_roots(ast.parse(path.read_text())) & FILESYSTEM_MODULES
+    ]
+    assert holders == ["workspace_fs.py"]
+
+
+def test_the_filesystem_executor_exposes_no_mutation_primitive() -> None:
+    """Read-only enforced against the AST, not merely asserted in a docstring."""
+    path = SRC / "executors" / "workspace_fs.py"
+    tree = ast.parse(path.read_text())
+
+    mutators = {
+        "write_text",
+        "write_bytes",
+        "unlink",
+        "rmdir",
+        "mkdir",
+        "rename",
+        "replace",
+        "chmod",
+        "lchmod",
+        "chown",
+        "touch",
+        "symlink_to",
+        "hardlink_to",
+        "link_to",
+        "rmtree",
+        "copy",
+        "copy2",
+        "copyfile",
+        "move",
+        "remove",
+        "makedirs",
+        "truncate",
+    }
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert not called & mutators, f"filesystem executor calls {called & mutators}"
+
+
+def test_the_filesystem_executor_only_opens_for_reading() -> None:
+    """Every `.open(...)` in the executor passes a literal read-only mode."""
+    path = SRC / "executors" / "workspace_fs.py"
+    tree = ast.parse(path.read_text())
+
+    modes: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "open":
+            continue
+        assert node.args, "open() must pass an explicit literal mode"
+        first = node.args[0]
+        assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
+            "open() mode must be a string literal, not a computed value"
+        )
+        modes.append(first.value)
+
+    assert modes, "expected at least one read in the filesystem executor"
+    for mode in modes:
+        assert mode.startswith("r"), f"non-read open mode: {mode!r}"
+        assert "+" not in mode, f"read/write open mode: {mode!r}"
 
 
 @pytest.mark.parametrize("path", _production_modules(), ids=lambda p: p.name)
@@ -180,3 +306,28 @@ def test_the_only_registered_tool_is_the_fake_file_search() -> None:
     assert spec.requires_authorization is True
     assert spec.timeout_seconds > 0
     assert type(spec.executor).__name__ == "FakeFileSearchExecutor"
+
+
+def test_the_filesystem_registry_holds_exactly_the_two_read_only_tools(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Milestone 2 grants two capabilities and no more (task §13)."""
+    from local_agent.wiring import build_filesystem_registry, build_physical_roots
+
+    (tmp_path / "workspace").mkdir()
+    (tmp_path / "knowledge").mkdir()
+    roots = build_physical_roots(
+        {"workspace": tmp_path / "workspace", "knowledge": tmp_path / "knowledge"}
+    )
+    registry = build_filesystem_registry(roots)
+
+    assert registry.names == frozenset({"workspace.read", "workspace.list"})
+    for name in registry.names:
+        spec = registry.get(name)
+        assert spec is not None
+        assert spec.destructive is False
+        assert spec.requires_authorization is True
+        assert spec.timeout_seconds > 0
+
+    for forbidden in ("workspace.write", "workspace.delete", "workspace.mkdir", "shell", "exec"):
+        assert registry.get(forbidden) is None

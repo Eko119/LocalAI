@@ -14,9 +14,9 @@ never sees.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 
 class _Strict(BaseModel):
@@ -49,6 +49,134 @@ class FileSearchResult(_Strict):
 
     status: Literal["success", "error"]
     data: list[str]
+
+
+# --------------------------------------------------------------------------
+# Filesystem capability (Milestone 2)
+# --------------------------------------------------------------------------
+
+# The complete model-facing namespace. The model names an abstract root; the
+# physical directory each one maps to lives only in trusted wiring and inside
+# the executor. See `executors/workspace_fs.py`.
+RootId = Literal["workspace", "knowledge"]
+
+# Structural ceiling on a model-supplied path. This is the schema's hard
+# boundary; `policy.FilesystemLimits.max_path_length` may tighten it further
+# for a given run, exactly as `max_results_ceiling` tightens `max_results`.
+MAX_PATH_LENGTH = 1024
+
+
+def _canonical_relative_path(value: str) -> str:
+    """Accept only a canonical, relative, POSIX-style path.
+
+    This is the *syntactic* half of the path security model, and it runs
+    before anything touches a filesystem. It rejects, by construction:
+
+    * absolute POSIX paths (`/etc/passwd`) — which would otherwise silently
+      replace the root when joined, since `Path("/root") / "/etc"` is `/etc`
+    * home expansion (`~/secret`) — this code never calls `expanduser`, but
+      a leading `~` is rejected rather than treated as a literal directory
+    * Windows drive paths (`C:\\x`, `C:/x`) and UNC paths (`\\\\server`) —
+      every backslash is refused, and so is a drive-letter prefix
+    * every `..` segment, and the non-canonical `.`, empty (`//`), and
+      trailing-separator forms that make one file reachable by many strings
+    * NUL bytes, which would otherwise fail deep inside the OS layer
+
+    The empty string is permitted and means "the root itself"; the read tool
+    additionally requires a non-empty path via its own `min_length`.
+
+    Physical containment is verified separately, after resolution, in the
+    executor. Neither layer is sufficient alone: this one cannot see
+    symlinks, and that one cannot run before a path has been joined.
+    """
+    if "\x00" in value:
+        raise ValueError("path must not contain a NUL byte")
+    if "\\" in value:
+        raise ValueError("path must not contain a backslash")
+    if value.startswith("/"):
+        raise ValueError("path must be relative, not absolute")
+    if value.startswith("~"):
+        raise ValueError("path must not start with '~'")
+    if len(value) >= 2 and value[1] == ":" and value[0].isalpha():
+        raise ValueError("path must not be a drive-qualified path")
+
+    if value == "":
+        return value
+
+    for segment in value.split("/"):
+        if segment == "":
+            raise ValueError("path must not contain an empty segment")
+        if segment == ".":
+            raise ValueError("path must not contain a '.' segment")
+        if segment == "..":
+            raise ValueError("path must not contain a '..' segment")
+
+    return value
+
+
+RelativePath = Annotated[str, AfterValidator(_canonical_relative_path)]
+
+
+class WorkspaceReadArgs(_Strict):
+    """Arguments for `workspace.read`.
+
+    Note what is absent: there is no byte count, no encoding, no offset, no
+    follow-symlinks flag, and no root path. Resource ceilings are policy
+    authority (`policy.FilesystemLimits`), and the physical root is wiring
+    authority. The model chooses *what* to read, never *how much* or *where
+    from* in physical terms.
+    """
+
+    root_id: RootId
+    path: RelativePath = Field(min_length=1, max_length=MAX_PATH_LENGTH)
+
+
+class WorkspaceListArgs(_Strict):
+    """Arguments for `workspace.list`.
+
+    `path` defaults to the empty string, which denotes the root directory
+    itself. That avoids needing a `.` segment, which the path validator
+    rejects to keep one file reachable by exactly one string.
+    """
+
+    root_id: RootId
+    path: RelativePath = Field(default="", max_length=MAX_PATH_LENGTH)
+
+
+class WorkspaceReadResult(_Strict):
+    """Result schema for `workspace.read`.
+
+    `path` echoes the model's own abstract path and `root_id` its abstract
+    root. No physical path, device, inode, owner, permission, or timestamp
+    appears anywhere in this shape.
+    """
+
+    status: Literal["success", "error"]
+    root_id: RootId
+    path: str
+    content: str
+    bytes_read: int
+
+
+class DirectoryEntry(_Strict):
+    """One entry in a directory listing.
+
+    `kind` is determined without following symlinks: an entry that is a
+    symlink is reported as such and its target is never stat'ed, so a link
+    pointing outside the root discloses nothing about what is out there.
+    """
+
+    name: str
+    kind: Literal["file", "directory", "symlink", "other"]
+
+
+class WorkspaceListResult(_Strict):
+    """Result schema for `workspace.list`. Entries are name-sorted; see the executor."""
+
+    status: Literal["success", "error"]
+    root_id: RootId
+    path: str
+    entries: list[DirectoryEntry]
 
 
 # --------------------------------------------------------------------------

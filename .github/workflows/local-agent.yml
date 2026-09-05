@@ -1,0 +1,61 @@
+---
+name: 'local-agent'
+
+# Scoped deliberately: this pipeline covers the Python agent subproject in
+# local-agent/ only. Changes to LocalAI's Go tree must not trigger it, and
+# this workflow must never gate them.
+on:
+  pull_request:
+    paths:
+      - 'local-agent/**'
+      - '.github/workflows/local-agent.yml'
+  push:
+    branches:
+      - master
+    paths:
+      - 'local-agent/**'
+      - '.github/workflows/local-agent.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-local-agent-${{ github.event.pull_request.number || github.sha }}-${{ github.repository }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: local-agent
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # The interpreter version is declared once, in local-agent/.python-version
+      # and pyproject's requires-python. uv reads both; nothing is duplicated here.
+      - name: install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.8.17'
+          enable-cache: true
+          cache-dependency-glob: 'local-agent/uv.lock'
+
+      - name: verify the lockfile is current
+        run: uv lock --check
+
+      - name: install the locked dependency set
+        run: uv sync --dev
+
+      - name: tests
+        run: uv run pytest -q
+
+      - name: lint
+        run: uv run ruff check .
+
+      - name: format check
+        run: uv run ruff format --check .
+
+      - name: type check
+        run: uv run mypy src tests

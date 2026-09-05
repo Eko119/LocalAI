@@ -17,6 +17,16 @@ The second half is what makes it a security test. `harness.executor.call_count`
 is the spy; use it. A test that only checks the error code would still pass if
 the controller executed the call and then reported an error.
 
+For the filesystem capability there is a **third** part, because the executor
+being dispatched is not the same question as bytes being read: assert with the
+`fs_spy` fixture that no physical read of an unauthorized location occurred.
+An executor that opened a file and *then* errored would satisfy both of the
+first two assertions while having already read the data.
+
+`test_the_filesystem_spy_records_real_reads` is the positive control for that
+fixture. Without it, a monkeypatch that silently stopped taking effect would
+make every "no read occurred" assertion pass vacuously. Never delete it.
+
 ## Suite layout
 
 | File | Proves |
@@ -25,7 +35,8 @@ the controller executed the call and then reported an error.
 | `test_state_machine.py` | every one of the 169 state pairs is legal or raises, per the table |
 | `test_adversarial.py` | the 20 required hostile-input cases |
 | `test_authority.py` | the architecture invariants (model cannot execute, authorize, retry more, …) |
-| `test_determinism.py` | 200 repetitions per scenario produce an identical trace |
+| `test_filesystem.py` | the read-only capability: traversal, symlinks, containment, ceilings, sanitization |
+| `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem scenario, identical traces |
 | `test_controller_flow.py` | gate ordering, audit events, budget arithmetic |
 | `test_architecture.py` | the capability boundary, enforced against the package AST |
 
@@ -43,5 +54,14 @@ the controller executed the call and then reported an error.
    normalized error code.
 4. **Exhaustive beats illustrative** where the space is small enough to walk —
    the transition table is checked as a full product, not by example.
-5. All four gates (`pytest`, `ruff check`, `ruff format --check`, `mypy`) pass
-   before a change is done.
+5. **Filesystem tests own their tree.** Build fixtures under pytest's
+   `tmp_path` and nowhere else. Never read the developer's home directory, the
+   repository, `/`, or any host location — a suite whose result depends on the
+   machine it runs on proves nothing about the code.
+6. **Assert positive and negative.** An inside-root symlink must work *and* an
+   outside-root one must fail; an authorized root must work *and* an
+   unauthorized one must fail. A test suite that only proves things are refused
+   cannot tell a working capability from a broken one.
+7. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
+   `mypy`) pass before a change is done. CI runs the same ones in the same
+   order.

@@ -5,9 +5,10 @@ build, import, or depend on LocalAI's Go code, and LocalAI does not depend on it
 Work here from `local-agent/`, not the repository root.
 
 Human and machine readers alike: the specification of record is the reference
-package summarised in [`docs/milestone-1-decisions.md`](docs/milestone-1-decisions.md).
-Where this file and that package disagree, the package wins, and the disagreement
-should be written down rather than resolved silently.
+package, summarised in [`docs/milestone-1-decisions.md`](docs/milestone-1-decisions.md)
+and [`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md). Where this
+file and that package disagree, the package wins, and the disagreement should be
+written down rather than resolved silently.
 
 ## The one idea
 
@@ -21,18 +22,26 @@ those, it is wrong regardless of how well it works.
 
 ## Current milestone
 
-Milestone 1: the deterministic control plane, proven by tests. Complete.
+Milestone 1 (deterministic control plane) and Milestone 2 (read-only filesystem
+capability) are both complete and gated by CI.
 
 **In scope:** state machine, typed contracts, tool registry, authorization,
-policy, retry budget, parser boundary, fake model adapter, fake file-search
-executor, audit events, tests.
+policy, retry budget, parser boundary, fake model adapter, audit events, the
+`workspace.read` / `workspace.list` capability, and tests.
 
-**Explicitly out of scope until a later milestone opens it:** real filesystem
-access, shell or subprocess execution, Playwright or any browser, network access
-of any kind, MCP, Docker code execution, Qdrant, SQLite persistence, Gemma, and
-llama.cpp. `tests/test_architecture.py` enforces this by parsing the package's
-own AST — adding `import subprocess` fails the suite, it does not merely
-violate a convention.
+**Explicitly out of scope until a later milestone opens it:** writes of any
+kind, shell or subprocess execution, Playwright or any browser, network access,
+MCP, Docker code execution, Qdrant, SQLite persistence, Gemma, llama.cpp, and
+OS-level sandboxing. `tests/test_architecture.py` enforces this by parsing the
+package's own AST — adding `import subprocess` fails the suite, it does not
+merely violate a convention.
+
+**The filesystem grant is per module.** `executors/workspace_fs.py` is the only
+production file allowed to import `pathlib` or touch a disk. That grant lives in
+`MODULE_IMPORT_GRANTS` in the architecture test and is mirrored in
+`.claude/hooks/milestone_scope_guard.py`; keep the two in step. Never widen the
+global allowlist to solve a one-module need — a global widening is exactly how
+the controller would quietly acquire filesystem access later.
 
 ## Rules
 
@@ -45,12 +54,14 @@ Detailed, enforceable rules live in `.claude/rules/`:
 ## Working commands
 
     uv sync --dev                  # create/refresh the project-local venv
+    uv lock --check                # the lockfile is current
     uv run pytest -q               # full suite
-    uv run ruff check src tests    # lint
-    uv run ruff format src tests   # format
+    uv run ruff check .            # lint
+    uv run ruff format --check .   # format
     uv run mypy src tests          # strict type check (pydantic plugin enabled)
 
-All four gates must pass before a change is considered done.
+All of these must pass before a change is considered done. They are the same
+commands CI runs, in the same order.
 
 ## Layout
 
@@ -63,8 +74,11 @@ All four gates must pass before a change is considered done.
       model_adapter.py  ModelAdapter protocol + deterministic fake
       events.py         structured audit records
       wiring.py         trusted startup assembly
-      executors/        tool implementations (Milestone 1: one fake)
-    tests/              unit, adversarial, authority, determinism, architecture
+      executors/
+        file_search.py  Milestone 1 deterministic fake
+        workspace_fs.py read-only filesystem — the sole holder of a disk grant
+    tests/              unit, adversarial, authority, filesystem, determinism,
+                        architecture
 
 ## A note on enforcement
 

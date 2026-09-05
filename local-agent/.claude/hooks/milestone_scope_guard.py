@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse guard: refuse edits and commands that break Milestone 1 scope.
+"""PreToolUse guard: refuse edits and commands that break the current milestone scope.
 
 This is a *defence-in-depth* layer, not the primary control. The primary
 controls are the typed contracts, the transition table, and
@@ -35,9 +35,11 @@ FORBIDDEN_COMMANDS = [
     (re.compile(r"\bdocker\s+(run|build|compose)\b"), "Docker execution is out of scope."),
     (re.compile(r"\bqdrant\b"), "Qdrant is out of scope until Phase 8."),
     (
-        re.compile(r"\b(pip|uv)\s+(pip\s+)?install\b.*\b"
-                   r"(playwright|selenium|qdrant-client|llama-cpp-python|torch|"
-                   r"transformers|docker|requests|httpx)\b"),
+        re.compile(
+            r"\b(pip|uv)\s+(pip\s+)?install\b.*\b"
+            r"(playwright|selenium|qdrant-client|llama-cpp-python|torch|"
+            r"transformers|docker|requests|httpx)\b"
+        ),
         "That dependency belongs to a later milestone.",
     ),
     (
@@ -48,6 +50,13 @@ FORBIDDEN_COMMANDS = [
 
 # Only guard the agent subproject's production package.
 GUARDED_PATH = re.compile(r"local-agent/src/local_agent/.*\.py$")
+
+# Milestone 2 granted filesystem access to exactly one module. The grant is
+# expressed here the same way it is in tests/test_architecture.py: per module,
+# never by widening the global rule. Keep the two in step.
+MODULE_GRANTS = {
+    "workspace_fs.py": {"pathlib"},
+}
 
 
 def _block(reason: str) -> None:
@@ -79,14 +88,16 @@ def main() -> None:
         if not GUARDED_PATH.search(path):
             sys.exit(0)
         written = " ".join(
-            str(tool_input.get(key, ""))
-            for key in ("content", "new_string", "new_str")
+            str(tool_input.get(key, "")) for key in ("content", "new_string", "new_str")
         )
-        match = FORBIDDEN_IMPORTS.search(written)
-        if match:
+        granted = MODULE_GRANTS.get(path.rsplit("/", 1)[-1], set())
+        for match in FORBIDDEN_IMPORTS.finditer(written):
+            module = match.group(1)
+            if module in granted:
+                continue
             _block(
-                f"`{match.group(0).strip()}` introduces a capability the milestone "
-                f"excludes (no filesystem, shell, network, or model runtime)."
+                f"`{match.group(0).strip()}` introduces a capability this module "
+                f"is not granted (no filesystem, shell, network, or model runtime)."
             )
 
     sys.exit(0)

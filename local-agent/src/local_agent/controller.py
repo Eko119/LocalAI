@@ -38,7 +38,7 @@ from .contracts import (
 from .events import Event, EventRecorder
 from .model_adapter import ModelAdapter
 from .policy import RunContext, authorize, evaluate_policy
-from .registry import ToolExecutionError, ToolRegistry, ToolSpec
+from .registry import ToolDenialError, ToolExecutionError, ToolRegistry, ToolSpec
 from .state_machine import Run, State
 
 # Model-facing wording. Deliberately terse and gate-agnostic: a denial must
@@ -324,8 +324,20 @@ class Controller:
             # Normalized, not propagated. The exception's own text is dropped.
             recorder.record("execution_failed", tool=spec.name, code="EXECUTION_TIMEOUT")
             raise _Rejection("EXECUTION_TIMEOUT", _TIMEOUT_MESSAGE) from exc
+        except ToolDenialError as exc:
+            # An authorization fact the executor could only establish by
+            # resolving the resource. Same code, same message, and the same
+            # non-retryable disposition as the AUTHORIZE and POLICY_CHECK
+            # gates — retrying a denial is just asking twice.
+            recorder.record("policy_rejected", tool=spec.name, reason=exc.reason)
+            raise _Rejection("POLICY_DENIED", _DENIED_MESSAGE) from exc
         except ToolExecutionError as exc:
-            recorder.record("execution_failed", tool=spec.name, code="EXECUTION_FAILED")
+            recorder.record(
+                "execution_failed",
+                tool=spec.name,
+                code="EXECUTION_FAILED",
+                reason=exc.reason,
+            )
             raise _Rejection("EXECUTION_FAILED", _EXECUTION_MESSAGE) from exc
         # Any other exception is a programmer error and propagates on purpose
         # (spec §"error_handling"): a blanket `except Exception` here would

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,9 +20,19 @@ import pytest
 from local_agent.contracts import ModelResponse
 from local_agent.controller import Controller, RunOutcome
 from local_agent.executors.file_search import FakeFileSearchExecutor
+from local_agent.executors.workspace_fs import (
+    PhysicalRoots,
+    WorkspaceListExecutor,
+    WorkspaceReadExecutor,
+)
 from local_agent.model_adapter import ScriptedModelAdapter
-from local_agent.policy import RunContext
-from local_agent.wiring import build_default_registry
+from local_agent.policy import DEFAULT_FILESYSTEM_LIMITS, FilesystemLimits, RunContext
+from local_agent.wiring import (
+    build_default_registry,
+    build_filesystem_registry,
+    build_filesystem_run_context,
+    build_physical_roots,
+)
 
 
 def tool_call_json(tool: str = "file_search", **arguments: Any) -> str:
@@ -127,3 +139,179 @@ class InjectingExecutor(RecordingExecutor):
     def execute(self, args: Any) -> Any:
         self.calls.append(args)
         return {"status": "success", "data": [self.PAYLOAD]}
+
+
+# ---------------------------------------------------------------------------
+# Milestone 2: controlled filesystem fixtures
+# ---------------------------------------------------------------------------
+#
+# Every filesystem test runs against a tree this module builds under pytest's
+# `tmp_path`. Nothing reads the developer's home directory, the repository, or
+# any host location, so the suite is reproducible and cannot be made to pass
+# (or fail) by the machine it runs on.
+
+
+@dataclass
+class FsFixture:
+    """An isolated filesystem tree plus the trusted root binding for it.
+
+    `external` and `workspace_evil` live *outside* the authorized roots on
+    purpose: they are the targets an escape attempt would reach if containment
+    failed, which is what makes the negative assertions meaningful.
+    """
+
+    base: Path
+    workspace: Path
+    knowledge: Path
+    external: Path
+    workspace_evil: Path
+    roots: PhysicalRoots
+
+    def outside_paths(self) -> tuple[Path, ...]:
+        return (self.external, self.workspace_evil)
+
+
+def build_fs_tree(base: Path) -> FsFixture:
+    """Construct the fixture tree. See `docs/milestone-2-decisions.md` for the map."""
+    workspace = base / "workspace"
+    knowledge = base / "knowledge"
+    external = base / "external"
+    # A sibling whose name has the authorized root's name as a string prefix.
+    # This exists solely to break a `startswith` containment check.
+    workspace_evil = base / "workspace_evil"
+
+    for directory in (workspace, knowledge, external, workspace_evil):
+        directory.mkdir(parents=True)
+
+    (workspace / "README.md").write_text("# workspace readme\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    (workspace / "nested").mkdir()
+    (workspace / "nested" / "file.txt").write_text("nested contents\n", encoding="utf-8")
+    (workspace / "real").mkdir()
+    (workspace / "real" / "inside.txt").write_text("inside contents\n", encoding="utf-8")
+
+    (knowledge / "notes.txt").write_text("knowledge notes\n", encoding="utf-8")
+    (external / "secret.txt").write_text("TOP SECRET EXTERNAL DATA\n", encoding="utf-8")
+    (workspace_evil / "loot.txt").write_text("SIBLING PREFIX LOOT\n", encoding="utf-8")
+
+    # Symlinks covering every case the policy has to answer for.
+    os.symlink(workspace / "real", workspace / "inside-link")
+    os.symlink(workspace / "real" / "inside.txt", workspace / "inside-file-link")
+    os.symlink(external, workspace / "outside-link")
+    os.symlink(external / "secret.txt", workspace / "outside-file-link")
+    os.symlink(workspace_evil, workspace / "sibling-link")
+    os.symlink(workspace / "missing-target", workspace / "broken-link")
+    os.symlink(workspace / "inside-link", workspace / "chain-link")
+    os.symlink("loop-b", workspace / "loop-a")
+    os.symlink("loop-a", workspace / "loop-b")
+
+    return FsFixture(
+        base=base,
+        workspace=workspace,
+        knowledge=knowledge,
+        external=external,
+        workspace_evil=workspace_evil,
+        roots=build_physical_roots({"workspace": workspace, "knowledge": knowledge}),
+    )
+
+
+@pytest.fixture
+def fs(tmp_path: Path) -> FsFixture:
+    return build_fs_tree(tmp_path)
+
+
+@dataclass
+class FsHarness:
+    """A controller wired to the real filesystem executors over a fixture tree."""
+
+    fixture: FsFixture
+    read_executor: WorkspaceReadExecutor
+    list_executor: WorkspaceListExecutor
+    adapter: ScriptedModelAdapter
+    controller: Controller
+    run_context: RunContext
+
+    @property
+    def executor_calls(self) -> int:
+        """Total invocations across both filesystem executors."""
+        return self.read_executor.call_count + self.list_executor.call_count
+
+    def run(self) -> RunOutcome:
+        return asyncio.run(
+            self.controller.run(self.run_context, [{"role": "user", "content": "read a file"}])
+        )
+
+
+def build_fs_harness(
+    fixture: FsFixture,
+    responses: Sequence[ModelResponse] | ModelResponse,
+    run_context: RunContext | None = None,
+    limits: FilesystemLimits = DEFAULT_FILESYSTEM_LIMITS,
+) -> FsHarness:
+    """Wire the production filesystem registry, keeping both executors as spies."""
+    if isinstance(responses, ModelResponse):
+        responses = (responses,)
+    read_executor = WorkspaceReadExecutor(fixture.roots, limits)
+    list_executor = WorkspaceListExecutor(fixture.roots, limits)
+    adapter = ScriptedModelAdapter(tuple(responses))
+    controller = Controller(
+        build_filesystem_registry(
+            fixture.roots,
+            limits,
+            read_executor=read_executor,
+            list_executor=list_executor,
+        ),
+        adapter,
+    )
+    return FsHarness(
+        fixture=fixture,
+        read_executor=read_executor,
+        list_executor=list_executor,
+        adapter=adapter,
+        controller=controller,
+        run_context=run_context or build_filesystem_run_context("run-fs", limits=limits),
+    )
+
+
+class FilesystemSpy:
+    """Records every physical read the run performs.
+
+    The executor's own `calls` list proves the *controller* did not dispatch a
+    rejected proposal. This proves something stronger and further down: that
+    no byte was read from the disk, by anyone, for a path the run was not
+    authorized to touch. Without it, a rejection test could pass while the
+    executor happily opened the file and then errored.
+    """
+
+    def __init__(self) -> None:
+        self.opened: list[str] = []
+        self.listed: list[str] = []
+
+    def touched_under(self, *roots: Path) -> list[str]:
+        prefixes = tuple(str(root) for root in roots)
+        return [
+            path
+            for path in (*self.opened, *self.listed)
+            if any(path == prefix or path.startswith(prefix + os.sep) for prefix in prefixes)
+        ]
+
+
+@pytest.fixture
+def fs_spy(monkeypatch: pytest.MonkeyPatch) -> FilesystemSpy:
+    """Patch the two physical read primitives to record what they are given."""
+    spy = FilesystemSpy()
+    real_open = Path.open
+    real_iterdir = Path.iterdir
+
+    def recording_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        spy.opened.append(str(self))
+        return real_open(self, *args, **kwargs)
+
+    def recording_iterdir(self: Path) -> Any:
+        spy.listed.append(str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "open", recording_open)
+    monkeypatch.setattr(Path, "iterdir", recording_iterdir)
+    return spy

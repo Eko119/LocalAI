@@ -34,7 +34,39 @@ class ToolExecutionError(RuntimeError):
     controller normalizes to `EXECUTION_FAILED`. Anything else an executor
     raises is a programmer error and is deliberately allowed to propagate
     (spec §"error_handling") instead of being swallowed by a blanket catch.
+
+    `reason` is a stable, controller-private slug for the audit stream. It
+    must never contain a path, a host detail, or an OS message; the
+    exception's own message is never forwarded to the model.
     """
+
+    def __init__(self, message: str = "", *, reason: str = "execution_failed") -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
+class ToolDenialError(RuntimeError):
+    """Raised by an executor when the request is not permitted, not merely failing.
+
+    Some authorization facts cannot be established without touching the
+    resource: whether a path stays inside its root can only be known after
+    the physical path is resolved, and resolution is the executor's job, not
+    the controller's. This exception is how an executor reports that
+    discovery.
+
+    It can only ever *deny*. An executor has no way to grant authority it was
+    not wired with, so admitting this direction is fail-closed: the controller
+    normalizes it to the same non-retryable `POLICY_DENIED` the AUTHORIZE and
+    POLICY_CHECK gates emit, with the same opaque message. The model cannot
+    tell which of the three said no.
+
+    `reason` is a controller-private slug for the audit stream and must never
+    carry a physical path.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 class ToolExecutor(Protocol):
