@@ -139,6 +139,46 @@ must remain unable to perform the operations they authorize.
   `^[A-Za-z0-9._-]{1,128}$` at the record boundary, which is what stops a run
   id from becoming a path traversal. Do not loosen that pattern.
 
+## The operator boundary
+
+- **An operator is a trusted actor and an untrusted source of values.** Both
+  halves hold at once. Every field of an `OperatorDecision` is checked against
+  something the controller derived from the journal moments earlier; the
+  decision's only job is to *match*.
+- **The prohibitions are schema-level, not check-level.** `OperatorDecision`
+  has no `tool`, no `arguments`, no `max_attempts`, no `root_id`, no
+  `side_effect_free`, and no executor selector, and `extra="forbid"` makes
+  adding one a violation. Never widen it — the missing fields are the
+  enforcement, and a validation rule would be weaker.
+- **A plan is content-addressed, and recording a decision changes its id.**
+  That is what makes staleness structural: an approval cannot be replayed
+  against the plan that produced it, a later plan, or another run. Never add a
+  code path that carries an approval forward to a regenerated plan.
+- **Re-validate after the decision is durable and before any executor.** The
+  registry, the argument schema, both gates and the execution identity are all
+  re-established. "The operator already approved it" is not a reason to skip
+  any of them.
+- **`execution_unknown` is never resumable, and that is deliberate.** Offering
+  it would let a human assert a fact the controller cannot verify. The cost —
+  an operator who knows the effect did not happen must start a new run — is the
+  accepted price.
+- **Abort is not a tool failure.** No synthesised `ToolExecutionError`, no
+  completion record, no fabricated result, no model turn. And it never rewrites
+  ambiguity: an authorization with no completion stays on disk exactly as it
+  was, beside the abort.
+- **A terminal run is final in every status.** `succeeded`, `failed` and
+  `aborted` alike offer no actions. Never add a resurrection path.
+- **The reason code is a slug, not prose.** `^[a-z][a-z0-9_]{0,63}$` cannot
+  spell an instruction, a JSON payload, or a path, which is why the operator
+  gets a code rather than a free-text field. Do not loosen it into a message.
+- **There is no operator identity, and none is claimed.** The project has no
+  authentication model, so no `operator` field is persisted: an
+  unauthenticated name would record a claim while implying a verified fact.
+  The interface is a trusted local control surface — say that, do not imply
+  more.
+- **No admin mode, ever.** No `--force`, `--unsafe`, `--bypass`, or any
+  equivalent. A generic override would undo every property above at once.
+
 ## Audit
 
 Events record structural facts only: state names, tool names, error codes,

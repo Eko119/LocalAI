@@ -8,8 +8,9 @@ Human and machine readers alike: the specification of record is the reference
 package, summarised in [`docs/milestone-1-decisions.md`](docs/milestone-1-decisions.md)
 [`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md),
 [`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md),
-[`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md), and
-[`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md). Where this
+[`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md),
+[`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md), and
+[`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md). Where this
 file and that package disagree, the package wins, and the disagreement should be
 written down rather than resolved silently.
 
@@ -26,8 +27,9 @@ those, it is wrong regardless of how well it works.
 ## Current milestone
 
 Milestones 1 (deterministic control plane), 2 (read-only filesystem),
-3 (production model adapter), 4 (live integration hardening) and 5 (durable
-run state and crash recovery) are complete and gated by CI.
+3 (production model adapter), 4 (live integration hardening), 5 (durable run
+state and crash recovery) and 6 (operator-controlled recovery) are complete and
+gated by CI.
 
 **Milestone 4 is hardened but not yet observed live.** No LocalAI instance was
 reachable where it was written, so the four live scenarios are implemented and
@@ -38,15 +40,17 @@ real instance. See `docs/milestone-4-decisions.md` §1 and §8.
 **In scope:** state machine, typed contracts, tool registry, authorization,
 policy, retry budget, parser boundary, audit events, the `workspace.read` /
 `workspace.list` capability, the LocalAI model adapter and its transport, the
-durable run journal with its recovery and replay, and tests.
+durable run journal with its recovery and replay, the operator control plane
+(inspection, decisions, approved resume, abort), and tests.
 
 **Explicitly out of scope until a later milestone opens it:** writes to a
 workspace, shell or subprocess execution, Playwright or any browser, network
 access outside the model transport, MCP, Docker code execution, Qdrant, SQLite,
-Gemma, llama.cpp, OS-level sandboxing, distributed coordination, and automatic
-resumption of a recovered run. `tests/test_architecture.py` enforces this by
-parsing the package's own AST — adding `import subprocess` fails the suite, it
-does not merely violate a convention.
+Gemma, llama.cpp, OS-level sandboxing, distributed coordination, automatic
+*unattended* resumption, authenticated operator identity, and a CLI binary.
+`tests/test_architecture.py` enforces this by parsing the package's own AST —
+adding `import subprocess` fails the suite, it does not merely violate a
+convention.
 
 **Capability grants are per module.** `executors/workspace_fs.py` and
 `persistence/journal.py` are the only production files allowed to touch a disk,
@@ -55,6 +59,26 @@ live in `MODULE_IMPORT_GRANTS` in the architecture test and are mirrored in
 `.claude/hooks/milestone_scope_guard.py`; keep the two in step. Never widen the
 global allowlist to solve a one-module need — a global widening is exactly how
 the controller would quietly acquire filesystem or network access later.
+
+**The operator decides; the controller acts.** An operator may say "I approve
+this exact controller-generated plan" and may not say "execute this". The
+difference is structural: `OperatorDecision` has no field for a tool, arguments,
+a budget, or an executor, and `extra="forbid"` makes adding one a schema
+violation. A plan is content-addressed, so recording any decision changes its
+identity and no approval can be replayed. Everything is re-validated from
+scratch — registry, argument schema, both gates, execution identity — *after*
+the decision is durable and *before* any executor runs. Never add a `--force`,
+`--unsafe`, `--bypass` or equivalent; there is no generic admin execution path
+and adding one would undo this milestone entirely.
+
+**Recovery never calls the model.** Not to plan, not to validate, not to decide
+whether resuming is safe. A model that could influence recovery would be an
+untrusted component deciding its own containment.
+
+**Abort is not a tool failure.** It synthesises no `ToolExecutionError`, no
+completion record, no result, and no model turn — and it never rewrites
+`execution_unknown` into "did not happen". Abort means "no further execution",
+never "the effect did not occur".
 
 **The durable store records; it never decides.** A journal is a representation
 of controller-owned state, not a second authority. Everything read back is
@@ -112,6 +136,7 @@ commands CI runs, in the same order.
       model_transport.py transport seam + deterministic scripted transport
       model_service.py  production LocalAI adapter (OpenAI-compatible)
       recovery.py       crash-recovery planning + observational replay (pure)
+      operator.py       operator control plane — decisions, binding, inspection
       executors/
         file_search.py  Milestone 1 deterministic fake
         workspace_fs.py read-only filesystem — sole holder of a read grant
@@ -121,8 +146,8 @@ commands CI runs, in the same order.
       transports/
         http.py         sole holder of a network grant
     tests/              unit, adversarial, authority, filesystem, model,
-                        transport, persistence, recovery, determinism,
-                        architecture
+                        transport, persistence, recovery, operator,
+                        determinism, architecture
       live_support.py   env conventions + gate semantics (test layer only)
       test_live_localai.py     opt-in live scenarios (marked `live`)
       test_live_boundary.py    deterministic proof of the gate semantics

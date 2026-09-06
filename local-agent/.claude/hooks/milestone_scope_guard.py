@@ -48,6 +48,66 @@ FORBIDDEN_COMMANDS = [
     ),
 ]
 
+# Milestone 6: there is no admin mode, and adding one would undo the milestone.
+# Matched in written source rather than in commands, because this is a thing an
+# assistant would *implement* under pressure to make a blocked recovery pass.
+# Milestone 6: there is no admin mode, and adding one would undo the milestone
+# in a single edit. Guarded here because this is the shape an assistant reaches
+# for under pressure to make a blocked recovery pass.
+#
+# Matched on *identifiers in executable position* rather than on text. The
+# project's own docstrings legitimately say "turns a denial into a bypass
+# tutorial" and "assumed unsafe to repeat", and a text scan flags those — the
+# same docstring-versus-code confusion that has bitten three checks in this
+# repository already. An identifier followed by `=`, `(` or `:` is code.
+BYPASS_WORDS = frozenset(
+    {
+        "force",
+        "unsafe",
+        "bypass",
+        "superuser",
+        "emergency",
+        "override",
+        "unrestricted",
+        "nocheck",
+        "noverify",
+        "unchecked",
+        "admin",
+    }
+)
+
+# An identifier (optionally after `def`/`class`) sitting where code puts one:
+# assigned to, called, or annotated.
+# A zero-width lookbehind rather than a consumed character: a consuming
+# boundary makes adjacent identifiers invisible, so `recover(force=False)`
+# would be missed because the match for `recover(` ate the paren.
+IDENTIFIER_IN_CODE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:def\s+|class\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[=(:]", re.MULTILINE
+)
+
+# The command-line spelling, which appears inside string literals rather than
+# as an identifier.
+BYPASS_FLAG = re.compile(r"--(force|unsafe|ignore-policy|bypass|superuser|emergency)\b")
+
+
+def _bypass_identifier(text: str) -> str | None:
+    """The first identifier in executable position built from a bypass word.
+
+    Split on `_` so `bypass_policy`, `allow_unsafe` and `FORCE_RESUME` are all
+    caught, while `enforcement` and `reinforce` are not — those contain
+    "force" as a substring but never as a part.
+    """
+    flag = BYPASS_FLAG.search(text)
+    if flag:
+        return flag.group(0)
+    for match in IDENTIFIER_IN_CODE.finditer(text):
+        name = match.group(1)
+        parts = {part for part in name.lower().split("_") if part}
+        if parts & BYPASS_WORDS:
+            return name
+    return None
+
+
 # Only guard the agent subproject's production package.
 GUARDED_PATH = re.compile(r"local-agent/src/local_agent/.*\.py$")
 
@@ -103,6 +163,13 @@ def main() -> None:
         written = " ".join(
             str(tool_input.get(key, "")) for key in ("content", "new_string", "new_str")
         )
+        bypass = _bypass_identifier(written)
+        if bypass:
+            _block(
+                f"`{bypass}` looks like a recovery or policy bypass. There is no admin "
+                f"mode: if recovery is blocked, the answer is a new run."
+            )
+
         granted = MODULE_GRANTS.get(path.rsplit("/", 1)[-1], set())
         for match in FORBIDDEN_IMPORTS.finditer(written):
             module = match.group(1)

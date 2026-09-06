@@ -37,6 +37,15 @@ EventType = Literal[
     "execution_failed",
     "verification_failed",
     "retry",
+    # Milestone 6: the operator control plane. Structural facts only, as
+    # everywhere else — an action name, a plan id, a sequence, a stable reason
+    # code. Never an operator identity, never free text.
+    "recovery_planned",
+    "operator_decision_recorded",
+    "recovery_revalidated",
+    "recovery_resumed",
+    "recovery_terminalized",
+    "recovery_declined",
     "terminal",
 ]
 

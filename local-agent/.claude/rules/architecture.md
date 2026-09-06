@@ -40,6 +40,10 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
 | what an execution is | `persistence.records.derive_execution_id` | an id read out of a file |
 | whether a crashed run may re-execute | `recovery.plan_recovery` + `ToolSpec.side_effect_free` | the journal's own claim |
 | whether repeating a tool is safe | trusted wiring, on the frozen `ToolSpec` | a proposal, a result, or a record |
+| which recovery actions exist | `recovery._available_actions` | an operator-supplied string |
+| what a recovery plan is | `recovery.plan_recovery` + `derive_plan_id` | a plan the operator submits |
+| whether a decision binds | `operator.validate_decision` | the decision's own say-so |
+| whether a resumed execution may run | `Controller._revalidate_recovery` | a recorded approval alone |
 
 ## Rules
 
@@ -95,3 +99,24 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
 14. **Replay observes; it cannot act.** `recovery.replay` takes no executor and
     must never reach `ToolSpec.executor`. Reconstructing a run is a read of
     records, so an untrusted journal has nothing there to trigger.
+15. **The operator picks from the controller's options; they do not supply
+    their own.** The controller derives the plan and its `available_actions`;
+    an `OperatorDecision` names one. Never accept a plan, a tool, arguments, a
+    budget, an execution identity, or an executor *from* an operator — and
+    never widen `OperatorDecision`, whose missing fields are the enforcement.
+16. **Approve, then re-establish everything.** An approval is a statement about
+    a moment. `Controller.recover` persists the decision, then re-reads the
+    journal, re-derives the plan, re-resolves the `ToolSpec`, re-validates the
+    arguments, re-runs both gates, and re-derives the execution identity before
+    an executor is reached. Never shortcut that with "the operator already
+    approved it".
+17. **Resume re-enters the ordinary path.** `Controller.run` and
+    `Controller.recover` share `_loop`; a resume differs only by taking its
+    operation from the journal instead of the model. Never add a second
+    execution path — a recovery executor would be a second place to forget a
+    gate. And never write a second `ExecutionAuthorized`: the write-ahead
+    record already on disk is the authorization.
+18. **There is no admin mode.** No `--force`, `--unsafe`, `--ignore-policy`,
+    `--bypass`, `--superuser`, `--emergency`, or any equivalent flag, kwarg or
+    environment variable. If recovery is blocked, the answer is a new run, not
+    a bypass.

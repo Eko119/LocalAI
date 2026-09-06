@@ -178,6 +178,12 @@ module's own AST.
 | A record claiming an unknown type or schema version | Refused before Pydantic sees it; unknown is never "probably fine" |
 | A truncated final line after a crash | Never `fsync`-returned, so never durable; dropped, not guessed at |
 | Replaying a hostile journal to force a side effect | `replay` takes no executor and cannot reach one |
+| An operator approval replayed against a later plan | Recording any decision changes the plan's content-addressed id |
+| An operator naming a different tool or arguments | The decision type has no field for either, and forbids extras |
+| An operator resuming an ambiguous, non-repeatable execution | Never offered; `available_actions` has no code path for it |
+| An operator reviving a terminal run | A terminal plan offers no actions, in every terminal status |
+| A `ToolSpec`, policy or grant changed after approval | Re-resolved and re-checked after the decision is durable, before any executor |
+| Operator text carrying an instruction to the model | The reason field is a slug charset, and nothing on this path reaches a model |
 
 Each row has a test, and each rejection test also asserts the executor's call
 count is zero.
@@ -286,7 +292,7 @@ That ordering is the whole design: a crash can then leave an authorization
 with no completion, which is a *detectable* ambiguity, whereas writing
 afterwards would leave a completed side effect with no record of it at all.
 
-**Recovery re-decides; it does not resume.** `plan_recovery` reads the journal
+**Recovery re-decides; it does not resume by itself.** `plan_recovery` reads the journal
 back and re-validates every record against the *live* registry and run
 context — the run id matches, the budget matches, the tool still exists, the
 arguments still validate against its current schema, the execution id
@@ -348,6 +354,109 @@ lock file precisely because the kernel releases it when the process dies —
 a crashed run is immediately recoverable rather than blocked forever by a
 stale lock.
 
+## Operator-controlled recovery
+
+Milestone 5 stopped at a plan. This layer lets a human act on one without
+becoming a general execution mechanism. The whole design is one sentence:
+
+> The operator may say **"I approve this exact controller-generated plan."**
+> The operator may not say **"execute this."**
+
+**The plan is controller-generated and content-addressed.** Its id is a hash
+over everything that decides what is being approved — disposition, tool,
+canonical arguments, execution identity, budget, available actions, and the
+number of decisions already recorded. An operator cannot construct a plan and
+have it believed, because the controller re-derives the id from the journal
+every time and compares.
+
+**Only valid actions are offered.** `available_actions` is derived from the
+run's state, so an action absent from it has no code path, not merely no
+permission:
+
+| Disposition | Offered |
+|---|---|
+| `terminal` | *nothing* |
+| `execution_pending_repeatable` (gates still pass) | resume, abort, terminalize, acknowledge, reject_recovery |
+| `execution_unknown` | abort, terminalize, acknowledge, reject_recovery |
+| `execution_completed` | abort, terminalize, acknowledge, reject_recovery |
+| `no_execution_authorized` | abort, terminalize, acknowledge, reject_recovery |
+
+**`execution_unknown` is never offered a resume**, and that restriction is
+deliberate. The tool is not side-effect free and the journal cannot say whether
+the effect happened, so letting the operator overrule it would be a human
+asserting a fact the controller cannot verify. The cost is real: an operator who
+*knows* the effect did not happen must still start a new run.
+
+```python
+from local_agent.operator import OperatorDecision, inspect_run, render_inspection
+
+with RunJournal(path) as journal:
+    print(render_inspection(inspect_run(journal.records(), registry, run_context)))
+
+    plan = plan_recovery(journal.records(), registry, run_context)
+    decision = OperatorDecision(
+        run_id=plan.run_id,
+        plan_id=plan.plan_id,  # bound to this exact plan
+        action="resume",  # chosen from available_actions
+        decision_sequence=plan.next_decision_sequence,
+        reason_code="verified_no_duplicate_effect",  # a slug, never prose
+        expected_execution_id=plan.execution_id,
+    )
+    outcome = asyncio.run(controller.recover(run_context, decision, messages))
+```
+
+**The decision has no vocabulary for execution.** No `tool`, no `arguments`, no
+`max_attempts`, no `root_id`, no `side_effect_free`, no executor selector — and
+`extra="forbid"`, so adding one in transit is a schema violation. The threat
+model's prohibitions are not rules the code checks; they are sentences the type
+cannot express. `reason_code` is constrained to `^[a-z][a-z0-9_]{0,63}$`, a
+charset that cannot spell an instruction or a JSON payload.
+
+**An approval cannot be replayed.** The plan id covers the decision count, so
+*recording* a decision changes the plan's identity. The approval that produced
+plan A does not name any plan that exists afterwards — staleness is structural
+rather than a rule someone has to apply.
+
+**Everything is re-established before the executor runs.** After the decision is
+durable, the controller re-reads the journal, re-derives the plan, re-resolves
+the `ToolSpec`, re-validates the arguments against its *current* schema, re-runs
+both gates, and re-derives the execution identity. An approval is a statement
+about a moment, and the moment ends when the decision is recorded.
+
+**Resume re-enters the ordinary path.** There is no recovery executor. `run()`
+and `recover()` share one loop; a resume differs only by taking its operation
+from the journal instead of the model, then walking the same gates in the same
+order to the same states. It reuses the original authorization rather than
+writing a second one, so a recovered run ends with exactly one authorization,
+one execution identity, and one completion.
+
+**Recovery never calls the model** — not to plan, not to validate, not to decide
+whether resuming is safe — and a successful recovery tells the model nothing
+about itself. Path A (an ordinary run) and Path B (crash → approve → resume)
+produce the same verified result, the same terminal, and the same state trace;
+the journals differ by exactly one audit record.
+
+**Abort is not a tool failure.** No synthesised exception, no completion record,
+no fabricated result, no further generation:
+
+```
+RECOVERY_REQUIRED → operator abort → persist decision → ABORTED → terminal
+```
+
+And it never rewrites ambiguity into failure. After aborting an
+`execution_unknown` run the journal still holds an authorization with **no**
+completion, beside the operator decision and an `aborted` terminal — so nobody
+reading it later can mistake an unknown outcome for a non-execution.
+
+**No admin mode exists.** There is no `--force`, `--unsafe`, `--ignore-policy`,
+`--bypass`, `--superuser` or `--emergency`, in any form. If recovery is blocked,
+the answer is a new run.
+
+**No operator identity is claimed.** The project has no authentication model, so
+no `operator` field is persisted — an unauthenticated name would record a claim
+while implying a verified fact. The interface is a trusted local control surface,
+and saying so is more honest than a field that looks like attribution.
+
 ## Layout
 
     src/local_agent/
@@ -363,6 +472,7 @@ stale lock.
       model_transport.py the transport seam + deterministic scripted transport
       model_service.py  the production LocalAI adapter
       recovery.py       crash-recovery planning + observational replay (pure)
+      operator.py       operator control plane — decisions, binding, inspection
       executors/
         file_search.py  the Milestone 1 deterministic fake
         workspace_fs.py the only module permitted to touch a filesystem
@@ -379,13 +489,15 @@ interface, tool specification, `ControllerError`, `ToolFeedback`, typed result
 boundary, authorization, policy, retry budget, parser boundary, audit events, a
 read-only filesystem capability, a production model adapter over LocalAI's
 OpenAI-compatible endpoint, a durable run journal with crash recovery and
-observational replay, and the test suite.
+observational replay, an operator control plane with bound approvals and
+auditable resume, and the test suite.
 
 **Deliberately absent:** writes to a workspace, shell or subprocess execution,
 Playwright or any browser, network access outside the model transport, MCP,
 Docker code execution, Qdrant, SQLite, Gemma, llama.cpp, OS-level sandboxing,
-distributed coordination, and automatic resumption — recovery produces a
-*plan*, and acting on it is a separate decision this milestone does not make.
+distributed coordination, a CLI binary, authenticated operator identity, and
+automatic *unattended* resumption — recovery produces a plan, and acting on it
+always requires an explicit, bound operator decision.
 `tests/test_architecture.py` enforces this against the package's own AST, with
 the filesystem grant scoped to one named module — the absence is checked, not
 merely stated.
@@ -397,4 +509,5 @@ merely stated.
 - [`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md) — model API selection, channel mapping, transport boundary, and what determinism does and does not mean here
 - [`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md) — live-integration gate semantics, credential handling, and what remains unobserved
 - [`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md) — durable state architecture, crash windows, execution semantics, and the proven/assumed/not-guaranteed split
+- [`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md) — operator authority, approval binding, revalidation, abort semantics, and why there is no operator identity
 - [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/) — working rules for this subproject

@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from local_agent.contracts import ModelResponse
+from local_agent.contracts import FileSearchArgs, FileSearchResult, ModelResponse
 from local_agent.controller import Controller, RunOutcome
 from local_agent.executors.file_search import FakeFileSearchExecutor
 from local_agent.executors.workspace_fs import (
@@ -31,6 +31,7 @@ from local_agent.model_service import LocalAIModelAdapter
 from local_agent.model_transport import ScriptedTransport, TransportResponse
 from local_agent.persistence.journal import RunJournal
 from local_agent.policy import DEFAULT_FILESYSTEM_LIMITS, FilesystemLimits, RunContext
+from local_agent.registry import ToolRegistry, ToolSpec
 from local_agent.wiring import (
     build_default_registry,
     build_filesystem_registry,
@@ -489,3 +490,244 @@ class CrashingExecutor(RecordingExecutor):
         self.calls.append(args)
         self._inner.execute(args)
         raise SimulatedCrash("during:execution")
+
+
+# ---------------------------------------------------------------------------
+# Milestone 6: operator-controlled recovery fixtures
+# ---------------------------------------------------------------------------
+
+
+class CrashingReadJournal(RunJournal):
+    """Dies on the Nth read-back after being armed, rather than on a write.
+
+    The write-side `CrashingJournal` cannot express every Milestone 6 window,
+    because recovery *reads* the journal twice: once to derive the plan and
+    once to re-derive it during immediate revalidation. Crashing on the second
+    read is the only way to land precisely between "the decision is durable"
+    and "the world was re-checked", which is the window that would matter most
+    if revalidation were ever quietly dropped.
+
+    Arming is explicit because a test has to read the journal itself to build
+    the decision it is about to submit. Counting those reads would make the
+    crash point depend on how the test was written rather than on where the
+    controller is, which is the opposite of a structural injection.
+    """
+
+    def __init__(self, path: Path | str, *, crash_on_read: int) -> None:
+        super().__init__(path)
+        self._crash_on_read = crash_on_read
+        self._armed = False
+        self.reads = 0
+
+    def arm(self) -> None:
+        self._armed = True
+        self.reads = 0
+
+    def records(self) -> Any:
+        if not self._armed:
+            return super().records()
+        self.reads += 1
+        if self.reads == self._crash_on_read:
+            raise SimulatedCrash(f"read:{self.reads}")
+        return super().records()
+
+
+class MutatingJournal(RunJournal):
+    """Runs a callback the instant a named record becomes durable.
+
+    Structural injection for the "the world changed between approval and
+    execution" case. Without it, every adversarial mutation test would have to
+    mutate *before* calling `recover`, which only ever exercises the binding
+    check — this reaches the immediate-revalidation check instead.
+    """
+
+    def __init__(self, path: Path | str, *, after: str, mutate: Callable[[], None]) -> None:
+        super().__init__(path)
+        self._after = after
+        self._mutate = mutate
+        self.fired = False
+
+    def append(self, record: Any) -> int:
+        seq = super().append(record)
+        if record.type == self._after and not self.fired:
+            self.fired = True
+            self._mutate()
+        return seq
+
+
+class CrashBeforeExecuteExecutor(RecordingExecutor):
+    """Dies without performing the physical call.
+
+    Crash window "after revalidation, before the executor did anything". The
+    inner executor it wraps is never invoked, which is what the test asserts:
+    the run reached the executor and still produced no side effect.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def execute(self, args: Any) -> Any:
+        self.calls.append(args)
+        raise SimulatedCrash("before:physical_call")
+
+
+def unsafe_file_search_spec(executor: Any) -> ToolSpec:
+    """The `file_search` tool declared *not* safe to repeat.
+
+    Identical to the production spec except for `side_effect_free=False` —
+    the fail-closed default a tool gets when nobody has thought about crash
+    behaviour. It exists so the ambiguity path can be tested without inventing
+    a second tool, and because every tool that ships today is repeatable, which
+    would otherwise leave `execution_unknown` untested against a real run.
+    """
+    return ToolSpec(
+        name="file_search",
+        args_schema=FileSearchArgs,
+        executor=executor,
+        timeout_seconds=5.0,
+        requires_authorization=True,
+        destructive=False,
+        result_schema=FileSearchResult,
+        side_effect_free=False,
+    )
+
+
+def unsafe_registry(executor: Any) -> ToolRegistry:
+    return ToolRegistry((unsafe_file_search_spec(executor),))
+
+
+VALID_PROPOSAL = json.dumps(
+    {"tool": "file_search", "arguments": {"query": "Jeep clutch notes", "root_id": "workspace"}}
+)
+
+RECOVERY_MESSAGES: list[dict[str, str]] = [{"role": "user", "content": "find my clutch notes"}]
+
+
+@dataclass
+class CrashedRun:
+    """A run that died mid-execution, plus everything needed to recover it."""
+
+    run_id: str
+    path: Path
+    run_context: RunContext
+    physical_executions: int
+
+
+def crash_mid_execution(
+    tmp_path: Path,
+    *,
+    run_id: str = "run-crashed",
+    repeatable: bool = True,
+    execute_physically: bool = True,
+    responses: Sequence[ModelResponse] | None = None,
+) -> CrashedRun:
+    """Drive a real controller into the ambiguous window and leave it there.
+
+    Uses the production controller, the production gates, and a real journal on
+    disk. Only the executor is a double, and only so the crash happens at a
+    chosen structural point rather than at a random one.
+    """
+    path = tmp_path / f"{run_id}.jsonl"
+    inner = FakeFileSearchExecutor()
+    crasher: Any = (
+        CrashingExecutor(inner) if execute_physically else CrashBeforeExecuteExecutor(inner)
+    )
+    registry = build_default_registry(crasher) if repeatable else unsafe_registry(crasher)
+    adapter = ScriptedModelAdapter(
+        tuple(responses) if responses else (ModelResponse(structured_output=VALID_PROPOSAL),)
+    )
+    context = RunContext(run_id=run_id)
+    with RunJournal(path) as journal:
+        controller = Controller(registry, adapter, journal=journal)
+        try:
+            asyncio.run(controller.run(context, RECOVERY_MESSAGES))
+        except SimulatedCrash:
+            pass
+        else:  # pragma: no cover - the double always crashes
+            raise AssertionError("the crashing executor did not crash")
+    return CrashedRun(
+        run_id=run_id,
+        path=path,
+        run_context=context,
+        physical_executions=inner.call_count,
+    )
+
+
+@dataclass
+class RecoveryHarness:
+    """A controller wired over an existing journal, with spies on both sides."""
+
+    controller: Controller
+    journal: RunJournal
+    executor: FakeFileSearchExecutor
+    adapter: ScriptedModelAdapter
+    registry: ToolRegistry
+    run_context: RunContext
+
+    def plan(self) -> Any:
+        from local_agent.recovery import plan_recovery
+
+        return plan_recovery(self.journal.records(), self.registry, self.run_context)
+
+    def inspect(self) -> Any:
+        from local_agent.operator import inspect_run
+
+        return inspect_run(self.journal.records(), self.registry, self.run_context)
+
+    def decide(self, action: str, reason_code: str = "operator_reviewed", **overrides: Any) -> Any:
+        """Build the decision the controller would accept for the current plan.
+
+        Overrides exist so an adversarial test can change exactly one field and
+        assert the refusal, without rebuilding the whole object by hand.
+        """
+        from local_agent.operator import OperatorDecision
+
+        plan = self.plan()
+        fields: dict[str, Any] = {
+            "run_id": plan.run_id,
+            "plan_id": plan.plan_id,
+            "action": action,
+            "decision_sequence": plan.next_decision_sequence,
+            "reason_code": reason_code,
+            "expected_execution_id": plan.execution_id,
+        }
+        fields.update(overrides)
+        return OperatorDecision(**fields)
+
+    def recover(self, decision: Any, messages: Sequence[dict[str, str]] | None = None) -> Any:
+        return asyncio.run(
+            self.controller.recover(
+                self.run_context,
+                decision,
+                RECOVERY_MESSAGES if messages is None else messages,
+            )
+        )
+
+
+def build_recovery_harness(
+    crashed: CrashedRun,
+    *,
+    repeatable: bool = True,
+    journal: RunJournal | None = None,
+    run_context: RunContext | None = None,
+    registry: ToolRegistry | None = None,
+    responses: Sequence[ModelResponse] | None = None,
+) -> RecoveryHarness:
+    """Re-open a crashed run's journal with a fresh controller and fresh spies."""
+    executor = FakeFileSearchExecutor()
+    resolved_registry = registry or (
+        build_default_registry(executor) if repeatable else unsafe_registry(executor)
+    )
+    adapter = ScriptedModelAdapter(
+        tuple(responses) if responses else (ModelResponse(structured_output=VALID_PROPOSAL),)
+    )
+    resolved_journal = journal or RunJournal(crashed.path)
+    return RecoveryHarness(
+        controller=Controller(resolved_registry, adapter, journal=resolved_journal),
+        journal=resolved_journal,
+        executor=executor,
+        adapter=adapter,
+        registry=resolved_registry,
+        run_context=run_context or crashed.run_context,
+    )

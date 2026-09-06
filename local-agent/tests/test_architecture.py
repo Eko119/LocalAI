@@ -825,3 +825,341 @@ def test_only_the_journal_writes_durable_state() -> None:
         if writes:
             writers.append(path.name)
     assert writers == ["journal.py"]
+
+
+# ===========================================================================
+# Milestone 6: the operator control plane
+#
+# An operator is trusted to *decide* and never trusted to *act*. These tests
+# make that structural rather than procedural: the module that handles operator
+# input has no path to an executor, no path to the model, and no way to mutate
+# any authority object.
+
+OPERATOR_MODULE = "operator.py"
+
+# Every object that holds authority. The operator layer may read a plan
+# derived from these; it may never assign to one.
+AUTHORITY_ATTRIBUTES = frozenset(
+    {
+        "max_attempts",
+        "authorized_tools",
+        "authorized_roots",
+        "allow_destructive",
+        "max_results_ceiling",
+        "filesystem",
+        "side_effect_free",
+        "requires_authorization",
+        "destructive",
+        "executor",
+        "args_schema",
+        "result_schema",
+        "timeout_seconds",
+    }
+)
+
+
+def _module(name: str) -> pathlib.Path:
+    matches = [path for path in _production_modules() if path.name == name]
+    assert matches, f"{name} is missing"
+    return matches[0]
+
+
+def _attribute_assignments(path: pathlib.Path) -> set[str]:
+    """Attribute names this module assigns to, anywhere."""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Attribute):
+                names.add(target.attr)
+    return names
+
+
+def _attribute_reads(path: pathlib.Path) -> set[str]:
+    """Attribute names this module reads, anywhere."""
+    return {
+        node.attr
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.Attribute)
+    }
+
+
+def _constructed_types(path: pathlib.Path) -> set[str]:
+    """Type names this module *calls* — i.e. constructs — ignoring definitions.
+
+    Deliberately not a text search: `records.py` defines the record class, and
+    a substring scan would count the `class` statement as a construction.
+    """
+    return {
+        node.func.id
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+
+def _called_methods(path: pathlib.Path) -> set[str]:
+    return {
+        node.func.attr
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+
+def test_the_operator_layer_cannot_invoke_an_executor() -> None:
+    """No `.execute(` and no `.executor` anywhere in the operator module.
+
+    The threat model's first prohibition — "the operator must not be able to
+    invoke an executor" — is checked here as an absence rather than as a guard,
+    because a guard can be removed by the same edit that adds the call.
+    """
+    path = _module(OPERATOR_MODULE)
+    assert "execute" not in _called_methods(path)
+    assert "executor" not in _attribute_reads(path)
+
+
+def test_the_operator_layer_cannot_reach_the_controller() -> None:
+    """Deciding and acting live in different modules, and only one can act."""
+    imported = _intra_package_imports(_module(OPERATOR_MODULE))
+    for forbidden in ("controller", "wiring"):
+        assert forbidden not in imported, f"operator.py imports {forbidden}"
+
+
+def test_the_operator_layer_cannot_reach_the_model_or_the_network() -> None:
+    """Task 10: no part of recovery may consult a model about its own safety."""
+    path = _module(OPERATOR_MODULE)
+    assert not _imported_roots(ast.parse(path.read_text())) & NETWORK_MODULES
+    imported = _intra_package_imports(path)
+    for forbidden in ("model_adapter", "model_service", "model_transport", "model_config"):
+        assert forbidden not in imported, f"operator.py imports {forbidden}"
+
+
+def test_the_operator_layer_cannot_touch_a_filesystem() -> None:
+    path = _module(OPERATOR_MODULE)
+    assert not _imported_roots(ast.parse(path.read_text())) & FILESYSTEM_MODULES
+
+
+@pytest.mark.parametrize("name", sorted(AUTHORITY_ATTRIBUTES))
+def test_the_operator_layer_assigns_to_no_authority_attribute(name: str) -> None:
+    """It cannot change the budget, the grants, the ToolSpec, or the roots.
+
+    Every one of these is frozen at runtime as well, so this is the second
+    lock rather than the only one — but a frozen dataclass raises where an AST
+    check *prevents*, and prevention is what a reviewer can see.
+    """
+    assert name not in _attribute_assignments(_module(OPERATOR_MODULE))
+
+
+def test_the_operator_boundary_check_actually_catches_a_violation() -> None:
+    """Adversarial test of the test: an operator module that executed must fail."""
+    poisoned = "def go(spec):\n    return spec.executor.execute(None)\n"
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        candidate = pathlib.Path(directory) / "operator.py"
+        candidate.write_text(poisoned)
+        assert "execute" in _called_methods(candidate)
+        assert "executor" in _attribute_reads(candidate)
+
+    # And the real module is clean, so the check is not trivially true.
+    assert "execute" not in _called_methods(_module(OPERATOR_MODULE))
+
+
+def test_the_authority_assignment_check_actually_catches_a_violation() -> None:
+    poisoned = "def widen(run):\n    run.max_attempts = 999\n"
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        candidate = pathlib.Path(directory) / "operator.py"
+        candidate.write_text(poisoned)
+        assert "max_attempts" in _attribute_assignments(candidate)
+
+
+def test_recovery_cannot_reach_the_model_the_network_or_a_filesystem() -> None:
+    """Restated for Milestone 6 now that recovery also runs the gates."""
+    path = _module("recovery.py")
+    roots = _imported_roots(ast.parse(path.read_text()))
+    assert not roots & NETWORK_MODULES
+    assert not roots & FILESYSTEM_MODULES
+    imported = _intra_package_imports(path)
+    for forbidden in ("model_adapter", "model_service", "model_transport", "controller"):
+        assert forbidden not in imported, f"recovery.py imports {forbidden}"
+
+
+def test_recovery_does_not_bypass_the_gates_it_reports_on() -> None:
+    """A plan's `authorization_valid` comes from the real gates, not a copy.
+
+    If recovery re-implemented authorization it would drift from the gate the
+    controller actually applies, and a plan could offer a resume that EXECUTE
+    would refuse — or worse, the reverse.
+    """
+    source = _code_without_docstrings(_module("recovery.py"))
+    assert "authorize(" in source
+    assert "evaluate_policy(" in source
+
+
+def test_the_recovery_planner_never_executes() -> None:
+    """The planner identifies what is safe; it does not do it."""
+    path = _module("recovery.py")
+    assert "execute" not in _called_methods(path)
+    assert "executor" not in _attribute_reads(path)
+
+
+def test_persistence_cannot_invoke_an_executor_or_a_model() -> None:
+    for name in sorted(PERSISTENCE_MODULES):
+        path = _module(name)
+        assert "execute" not in _called_methods(path), f"{name} calls execute"
+        assert "executor" not in _attribute_reads(path), f"{name} reaches an executor"
+
+
+def test_only_the_controller_persists_an_operator_decision() -> None:
+    """Recording a decision is an act, and acts belong to the controller.
+
+    In particular the operator module must not be able to write its own
+    decision: that would let the control plane manufacture the evidence that
+    a human was asked.
+    """
+    writers = [
+        path.name
+        for path in _production_modules()
+        if "OperatorDecisionRecorded" in _constructed_types(path)
+    ]
+    assert writers == ["controller.py"]
+
+
+def test_the_operator_decision_contract_exposes_no_execution_fields() -> None:
+    """Read the schema, not the docs: the type must have no way to say "run X"."""
+    from local_agent.operator import OperatorDecision
+
+    fields = set(OperatorDecision.model_fields)
+    assert fields == {
+        "schema_version",
+        "run_id",
+        "plan_id",
+        "action",
+        "decision_sequence",
+        "reason_code",
+        "expected_execution_id",
+    }
+    assert OperatorDecision.model_config["extra"] == "forbid"
+    assert OperatorDecision.model_config["frozen"] is True
+
+
+def test_a_terminal_run_offers_no_action_in_any_disposition() -> None:
+    """Terminality is enforced in the action table itself, not at the call site."""
+    from local_agent.recovery import _available_actions
+
+    assert _available_actions("terminal", authorization_valid=True, decisions=0) == ()
+
+
+def test_only_a_repeatable_pending_execution_is_ever_offered_a_resume() -> None:
+    """Exhaustive over the disposition space, because the space is small."""
+    from local_agent.recovery import Disposition, _available_actions
+
+    dispositions: tuple[Disposition, ...] = (
+        "terminal",
+        "no_execution_authorized",
+        "execution_completed",
+        "execution_pending_repeatable",
+        "execution_unknown",
+    )
+    offered = {
+        (disposition, valid): "resume"
+        in _available_actions(disposition, authorization_valid=valid, decisions=0)
+        for disposition in dispositions
+        for valid in (True, False)
+    }
+    assert {key for key, value in offered.items() if value} == {
+        ("execution_pending_repeatable", True)
+    }
+
+
+# The hook in `.claude/hooks/` is advisory; this is the enforcement. There must
+# be no bypass mechanism in production source under any spelling — no flag, no
+# keyword argument, no attribute, no environment switch.
+BYPASS_WORDS = frozenset(
+    {
+        "force",
+        "unsafe",
+        "bypass",
+        "superuser",
+        "emergency",
+        "override",
+        "unrestricted",
+        "nocheck",
+        "noverify",
+        "unchecked",
+        "admin",
+    }
+)
+
+
+def _identifiers_defined_or_bound(path: pathlib.Path) -> set[str]:
+    """Names this module defines, binds, parameterises, or assigns as attributes.
+
+    Deliberately not a text scan: the package's own docstrings say things like
+    "turns a denial into a bypass tutorial" and "assumed unsafe to repeat", and
+    a substring search flags those. What matters is whether a *name* exists.
+    """
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+            arguments = getattr(node, "args", None)
+            if arguments is not None:
+                for group in (
+                    arguments.posonlyargs,
+                    arguments.args,
+                    arguments.kwonlyargs,
+                ):
+                    names.update(argument.arg for argument in group)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.keyword) and node.arg:
+            names.add(node.arg)
+    return names
+
+
+@pytest.mark.parametrize("path", _production_modules(), ids=lambda p: p.name)
+def test_no_module_offers_a_bypass_mechanism(path: pathlib.Path) -> None:
+    """No `--force`, `--unsafe`, `--bypass`, `--superuser`, or equivalent.
+
+    Split on `_` so `bypass_policy`, `allow_unsafe` and `FORCE_RESUME` are all
+    caught while `enforce` and `reinforce` are not — those contain a banned
+    word as a substring but never as a part, which is the distinction that
+    separates a bypass from ordinary English.
+    """
+    offenders = {
+        name
+        for name in _identifiers_defined_or_bound(path)
+        if {part for part in name.lower().split("_") if part} & BYPASS_WORDS
+    }
+    assert not offenders, f"{path.name} defines a bypass-shaped name: {sorted(offenders)}"
+
+
+def test_the_bypass_check_actually_catches_a_violation() -> None:
+    """Adversarial: a controller that took a `force` flag must fail the check."""
+    poisoned = "async def recover(self, decision, force: bool = False):\n    return force\n"
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        candidate = pathlib.Path(directory) / "controller.py"
+        candidate.write_text(poisoned)
+        names = _identifiers_defined_or_bound(candidate)
+        assert "force" in names
+
+    # And a legitimate near-miss is not caught, so the check is not a word ban.
+    with tempfile.TemporaryDirectory() as directory:
+        innocent = pathlib.Path(directory) / "policy.py"
+        innocent.write_text("def enforce(rule):\n    return reinforce(rule)\n")
+        names = _identifiers_defined_or_bound(innocent)
+        assert not {
+            name
+            for name in names
+            if {part for part in name.lower().split("_") if part} & BYPASS_WORDS
+        }

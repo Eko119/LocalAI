@@ -42,16 +42,20 @@ from .model_adapter import (
     ModelTransportError,
     ModelTransportTimeout,
 )
+from .operator import OperatorDecision, validate_decision
 from .persistence.journal import RunJournal
 from .persistence.records import (
     DurableRecord,
     ExecutionAuthorized,
     ExecutionCompleted,
+    OperatorAction,
+    OperatorDecisionRecorded,
     RunStarted,
     RunTerminal,
     derive_execution_id,
 )
 from .policy import RunContext, authorize, evaluate_policy
+from .recovery import Disposition, RecoveryPlan, plan_recovery
 from .registry import ToolDenialError, ToolExecutionError, ToolRegistry, ToolSpec
 from .state_machine import Run, State
 
@@ -138,6 +142,66 @@ def _sanitize_validation_errors(exc: ValidationError) -> list[dict[str, object]]
     return sanitized
 
 
+class RecoveryRefused(Exception):
+    """The controller refused to act on a recovery decision.
+
+    Distinct from `OperatorDecisionRejected`, which means the decision did not
+    bind to the plan. This means the decision bound, was recorded, and then the
+    world failed re-validation between recording and execution — or that
+    recovery was asked of a controller with no durable state to recover from.
+
+    `reason` is a stable slug. It is safe to show an operator and never reaches
+    a model, because nothing on this path talks to one.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class _ResumeSeed:
+    """One authorized-but-uncompleted execution, ready to re-enter the loop.
+
+    Carries the *original* operation: the tool the controller resolved from the
+    live registry, the canonical arguments re-validated against that tool's
+    current schema, and the execution identity re-derived from both. Nothing
+    here came from the operator, and nothing here is a new authorization — the
+    write-ahead record already on disk is the authorization, which is why
+    resuming does not write a second one.
+    """
+
+    spec: ToolSpec
+    args: BaseModel
+    step_id: str
+    attempt: int
+    execution_id: str
+
+
+@dataclass(frozen=True)
+class RecoveryOutcome:
+    """What the controller did about one operator decision.
+
+    Operator-facing, not model-facing. It exists because the operator needs to
+    know what happened; nothing in it is ever shown to a model, and the
+    ordinary `RunOutcome` a resume produces is the same shape an uninterrupted
+    run produces, so recovery adds no second model protocol.
+    """
+
+    run_id: str
+    action: OperatorAction
+    plan_id: str
+    decision_sequence: int
+    disposition: Disposition
+    reason_code: str
+    resulting_state: str
+    terminal: bool
+    terminal_status: str | None = None
+    executed: bool = False
+    execution_id: str | None = None
+    run: RunOutcome | None = None
+
+
 @dataclass(frozen=True)
 class RunOutcome:
     """Everything a caller (or a test) needs to audit one run."""
@@ -184,8 +248,28 @@ class Controller:
         self._enter(machine, recorder, State.CLASSIFY)
         self._enter(machine, recorder, State.GENERATE)
 
-        step_id = f"{run_context.run_id}-s1"
-        attempt = 1
+        return await self._loop(run_context, messages, machine, recorder, seed=None)
+
+    async def _loop(
+        self,
+        run_context: RunContext,
+        messages: Sequence[dict[str, str]],
+        machine: Run,
+        recorder: EventRecorder,
+        *,
+        seed: _ResumeSeed | None,
+    ) -> RunOutcome:
+        """The attempt loop. One entry point for a fresh run and for a resume.
+
+        `seed` is the only difference between the two. When it is present the
+        first iteration takes its operation from the journal instead of the
+        model — the states walked, the gates run, the verification applied and
+        the continuation that follows are all the ordinary ones. There is no
+        recovery-specific execution path, and that is deliberate: a second path
+        would be a second place for a gate to be forgotten.
+        """
+        step_id = seed.step_id if seed is not None else f"{run_context.run_id}-s1"
+        attempt = seed.attempt if seed is not None else 1
         feedback: ToolFeedback | None = None
         last_error: ControllerError | None = None
 
@@ -194,42 +278,59 @@ class Controller:
             tool_name = "unknown"
 
             try:
-                request = ModelRequest(
-                    run_id=run_context.run_id,
-                    step_id=step_id,
-                    attempt=attempt,
-                    messages=tuple(messages),
-                    feedback=feedback,
-                )
-                try:
-                    response = await self._adapter.chat(request)
-                except ModelTransportTimeout as exc:
-                    recorder.record("model_call_failed", attempt=attempt, reason=exc.reason)
-                    raise _Rejection("EXECUTION_TIMEOUT", _MODEL_TIMEOUT_MESSAGE) from exc
-                except ModelTransportError as exc:
-                    recorder.record("model_call_failed", attempt=attempt, reason=exc.reason)
-                    raise _Rejection("EXECUTION_FAILED", _MODEL_UNAVAILABLE_MESSAGE) from exc
-                except ModelResponseInvalid as exc:
-                    recorder.record("model_call_failed", attempt=attempt, reason=exc.reason)
-                    raise _Rejection("VERIFICATION_FAILED", _MODEL_RESPONSE_MESSAGE) from exc
-                # Any other exception from an adapter is a programmer error and
-                # propagates on purpose, exactly as it does for an executor.
+                if seed is not None:
+                    # RESUMED ITERATION. The operation is already known and
+                    # already durably authorized, so no generation is requested
+                    # and no model output is parsed. The states are still
+                    # walked, because this run really did pass through them
+                    # before it crashed — the same run is continuing, not a new
+                    # one skipping gates. Everything below this branch is the
+                    # ordinary path, shared byte-for-byte with a fresh run.
+                    spec, args = seed.spec, seed.args
+                    tool_name = spec.name
+                    resumed_execution_id: str | None = seed.execution_id
+                    seed = None
+                    self._enter(machine, recorder, State.PARSE)
+                    self._enter(machine, recorder, State.VALIDATE)
+                    recorder.record("recovery_resumed", tool=tool_name, attempt=attempt)
+                else:
+                    resumed_execution_id = None
+                    request = ModelRequest(
+                        run_id=run_context.run_id,
+                        step_id=step_id,
+                        attempt=attempt,
+                        messages=tuple(messages),
+                        feedback=feedback,
+                    )
+                    try:
+                        response = await self._adapter.chat(request)
+                    except ModelTransportTimeout as exc:
+                        recorder.record("model_call_failed", attempt=attempt, reason=exc.reason)
+                        raise _Rejection("EXECUTION_TIMEOUT", _MODEL_TIMEOUT_MESSAGE) from exc
+                    except ModelTransportError as exc:
+                        recorder.record("model_call_failed", attempt=attempt, reason=exc.reason)
+                        raise _Rejection("EXECUTION_FAILED", _MODEL_UNAVAILABLE_MESSAGE) from exc
+                    except ModelResponseInvalid as exc:
+                        recorder.record("model_call_failed", attempt=attempt, reason=exc.reason)
+                        raise _Rejection("VERIFICATION_FAILED", _MODEL_RESPONSE_MESSAGE) from exc
+                    # Any other exception from an adapter is a programmer error
+                    # and propagates on purpose, as it does for an executor.
 
-                recorder.record(
-                    "model_output_received",
-                    attempt=attempt,
-                    # Structural facts only — never the generated text itself.
-                    has_structured_output=response.structured_output is not None,
-                    has_reasoning=response.reasoning is not None,
-                )
+                    recorder.record(
+                        "model_output_received",
+                        attempt=attempt,
+                        # Structural facts only — never the generated text.
+                        has_structured_output=response.structured_output is not None,
+                        has_reasoning=response.reasoning is not None,
+                    )
 
-                self._enter(machine, recorder, State.PARSE)
-                candidate = parse_candidate(response)
-                tool_name = candidate.tool
-                recorder.record("candidate_parsed", tool=tool_name, attempt=attempt)
+                    self._enter(machine, recorder, State.PARSE)
+                    candidate = parse_candidate(response)
+                    tool_name = candidate.tool
+                    recorder.record("candidate_parsed", tool=tool_name, attempt=attempt)
 
-                self._enter(machine, recorder, State.VALIDATE)
-                spec, args = self._validate(candidate, recorder)
+                    self._enter(machine, recorder, State.VALIDATE)
+                    spec, args = self._validate(candidate, recorder)
 
                 self._enter(machine, recorder, State.AUTHORIZE)
                 self._authorize(spec, args, run_context, recorder)
@@ -238,29 +339,36 @@ class Controller:
                 self._policy(spec, args, run_context, recorder)
 
                 self._enter(machine, recorder, State.EXECUTE)
-                # WRITE-AHEAD BOUNDARY. The authorization is durable before
-                # the executor is invoked, so a crash *during* execution is
-                # detectable: the journal then holds an authorization with no
-                # matching completion. Without this ordering the ambiguous
-                # window would be silent rather than merely ambiguous.
-                execution_id = derive_execution_id(
-                    run_context.run_id,
-                    step_id,
-                    attempt,
-                    spec.name,
-                    args.model_dump(mode="json"),
-                )
-                self._persist(
-                    ExecutionAuthorized(
-                        run_id=run_context.run_id,
-                        step_id=step_id,
-                        attempt=attempt,
-                        tool=spec.name,
-                        arguments=args.model_dump(mode="json"),
-                        execution_id=execution_id,
-                        side_effect_free=spec.side_effect_free,
+                if resumed_execution_id is not None:
+                    # The write-ahead record already on disk is still the
+                    # authorization for this execution. Writing a second one
+                    # would forge an authorization the controller never made,
+                    # and recovery would reject the journal for it.
+                    execution_id = resumed_execution_id
+                else:
+                    # WRITE-AHEAD BOUNDARY. The authorization is durable before
+                    # the executor is invoked, so a crash *during* execution is
+                    # detectable: the journal then holds an authorization with
+                    # no matching completion. Without this ordering the
+                    # ambiguous window would be silent rather than ambiguous.
+                    execution_id = derive_execution_id(
+                        run_context.run_id,
+                        step_id,
+                        attempt,
+                        spec.name,
+                        args.model_dump(mode="json"),
                     )
-                )
+                    self._persist(
+                        ExecutionAuthorized(
+                            run_id=run_context.run_id,
+                            step_id=step_id,
+                            attempt=attempt,
+                            tool=spec.name,
+                            arguments=args.model_dump(mode="json"),
+                            execution_id=execution_id,
+                            side_effect_free=spec.side_effect_free,
+                        )
+                    )
                 try:
                     raw_result = self._execute(spec, args, tool_call_id, attempt, recorder)
                 except _Rejection as rejection:
@@ -358,6 +466,247 @@ class Controller:
         """
         if self._journal is not None:
             self._journal.append(record)
+
+    # -- operator-controlled recovery (Milestone 6) -----------------------
+
+    async def recover(
+        self,
+        run_context: RunContext,
+        decision: OperatorDecision,
+        messages: Sequence[dict[str, str]] = (),
+    ) -> RecoveryOutcome:
+        """Act on one explicit operator decision about one crashed run.
+
+        The order of operations is the security property, so it is worth
+        stating plainly:
+
+        1. the controller derives the plan from the journal — the operator
+           never supplies one;
+        2. the decision is bound to that exact plan, or refused, with nothing
+           persisted and nothing executed;
+        3. the decision is persisted durably, *before* anything acts on it;
+        4. **everything is re-validated from scratch**, against a freshly
+           re-read journal and the live registry, `RunContext` and gates;
+        5. only then does the ordinary execution path run — the same
+           `_loop` a fresh run uses, with the same gates in the same order.
+
+        Step 4 is not redundant with step 2. An approval is a statement about a
+        moment, and the moment ends the instant the decision is recorded: the
+        registry may have changed, the run's grants may have narrowed, the
+        journal may have grown. The controller therefore trusts the approval
+        for exactly one thing — that a human said yes to this plan — and
+        re-establishes every other fact for itself.
+
+        `messages` is supplied by the caller because the journal deliberately
+        never stored the conversation. A resume that succeeds does not use it;
+        a resume whose execution fails and still has budget continues into an
+        ordinary retry, which does need something to send.
+        """
+        if self._journal is None:
+            # Recovery is about durable state. Without a journal there is
+            # nothing to recover from, and inventing a plan from memory would
+            # be the controller trusting itself instead of its evidence.
+            raise RecoveryRefused("recovery_requires_a_journal")
+
+        recorder = EventRecorder(run_context.run_id)
+        plan = plan_recovery(self._journal.records(), self._registry, run_context)
+        recorder.record(
+            "recovery_planned",
+            disposition=plan.disposition,
+            plan_id=plan.plan_id,
+            actions=len(plan.available_actions),
+        )
+
+        # Binding. Raises OperatorDecisionRejected, having persisted nothing.
+        validate_decision(decision, plan)
+
+        self._persist(
+            OperatorDecisionRecorded(
+                run_id=run_context.run_id,
+                decision_sequence=decision.decision_sequence,
+                action=decision.action,
+                plan_id=decision.plan_id,
+                expected_execution_id=decision.expected_execution_id,
+                reason_code=decision.reason_code,
+            )
+        )
+        recorder.record(
+            "operator_decision_recorded",
+            action=decision.action,
+            decision_sequence=decision.decision_sequence,
+            reason=decision.reason_code,
+        )
+
+        seed = self._revalidate_recovery(run_context, plan, decision, recorder)
+
+        if decision.action == "resume":
+            assert seed is not None  # _revalidate_recovery guarantees it
+            machine = Run()
+            recorder.record("state_entered", state=State.RECEIVE.value)
+            self._enter(machine, recorder, State.CLASSIFY)
+            self._enter(machine, recorder, State.GENERATE)
+            outcome = await self._loop(run_context, messages, machine, recorder, seed=seed)
+            return RecoveryOutcome(
+                run_id=run_context.run_id,
+                action=decision.action,
+                plan_id=plan.plan_id,
+                decision_sequence=decision.decision_sequence,
+                disposition=plan.disposition,
+                reason_code=plan.reason_code,
+                resulting_state=State.TERMINAL.value,
+                terminal=True,
+                terminal_status=outcome.terminal.status,
+                executed=True,
+                execution_id=plan.execution_id,
+                run=outcome,
+            )
+
+        if decision.action in ("abort", "terminalize"):
+            # No executor, no model, no retry, and no fabricated result. An
+            # abort is a controller decision to stop; it is emphatically not a
+            # tool failure, and nothing here synthesises one.
+            status = "aborted" if decision.action == "abort" else "failed"
+            code = "OPERATOR_ABORT" if decision.action == "abort" else "OPERATOR_TERMINALIZED"
+            self._persist(
+                RunTerminal(
+                    run_id=run_context.run_id,
+                    status=status,
+                    code=code,
+                    attempts=plan.attempt or 1,
+                )
+            )
+            recorder.record("recovery_terminalized", action=decision.action, status=status)
+            recorder.record("terminal", status=status, code=code, attempts=plan.attempt or 1)
+            return RecoveryOutcome(
+                run_id=run_context.run_id,
+                action=decision.action,
+                plan_id=plan.plan_id,
+                decision_sequence=decision.decision_sequence,
+                disposition=plan.disposition,
+                reason_code=plan.reason_code,
+                resulting_state=State.TERMINAL.value,
+                terminal=True,
+                terminal_status=status,
+                executed=False,
+                execution_id=plan.execution_id,
+            )
+
+        # `acknowledge` and `reject_recovery`. The decision is recorded and the
+        # run is left exactly as it was: not executed, not terminal, and — via
+        # the new decision changing the plan's identity — needing a fresh plan
+        # and a fresh decision before anything can happen.
+        recorder.record("recovery_declined", action=decision.action)
+        return RecoveryOutcome(
+            run_id=run_context.run_id,
+            action=decision.action,
+            plan_id=plan.plan_id,
+            decision_sequence=decision.decision_sequence,
+            disposition=plan.disposition,
+            reason_code=plan.reason_code,
+            resulting_state=plan.disposition,
+            terminal=False,
+            executed=False,
+            execution_id=plan.execution_id,
+        )
+
+    def _revalidate_recovery(
+        self,
+        run_context: RunContext,
+        plan: RecoveryPlan,
+        decision: OperatorDecision,
+        recorder: EventRecorder,
+    ) -> _ResumeSeed | None:
+        """Re-establish every fact from scratch, after the decision is durable.
+
+        Two halves. The first re-reads the journal and re-derives the plan,
+        proving that the world the operator approved is still the world that
+        exists — and that the decision was recorded exactly once. The second
+        runs only for `resume`, and re-resolves the tool, re-validates the
+        arguments against its *current* schema, re-runs both gates, and
+        re-derives the execution identity, so nothing reaches the executor on
+        an assumption carried over from before.
+        """
+        assert self._journal is not None  # caller checked
+        fresh = plan_recovery(self._journal.records(), self._registry, run_context)
+
+        if fresh.run_id != run_context.run_id:
+            raise RecoveryRefused("run_id_changed")
+        if fresh.is_terminal:
+            raise RecoveryRefused("run_became_terminal")
+        if fresh.max_attempts != plan.max_attempts:
+            raise RecoveryRefused("retry_budget_changed")
+        if fresh.disposition != plan.disposition:
+            raise RecoveryRefused("disposition_changed")
+        if fresh.execution_id != plan.execution_id:
+            raise RecoveryRefused("execution_identity_changed")
+        if fresh.tool != plan.tool:
+            raise RecoveryRefused("tool_changed")
+        if fresh.arguments != plan.arguments:
+            raise RecoveryRefused("arguments_changed")
+        if fresh.attempt != plan.attempt or fresh.step_id != plan.step_id:
+            raise RecoveryRefused("execution_position_changed")
+        if fresh.side_effect_free != plan.side_effect_free:
+            raise RecoveryRefused("side_effect_flag_changed")
+        if fresh.decisions_recorded != plan.decisions_recorded + 1:
+            # Exactly one decision was added: this one. More would mean a
+            # concurrent writer; fewer would mean the write did not land.
+            raise RecoveryRefused("decision_not_recorded_exactly_once")
+        if fresh.last_action != decision.action:
+            raise RecoveryRefused("recorded_decision_mismatch")
+
+        recorder.record("recovery_revalidated", action=decision.action, plan_id=plan.plan_id)
+
+        if decision.action != "resume":
+            return None
+
+        if not fresh.authorization_valid:
+            raise RecoveryRefused("authorization_no_longer_valid")
+
+        assert fresh.tool is not None
+        assert fresh.arguments is not None
+        assert fresh.step_id is not None
+        assert fresh.attempt is not None
+        assert fresh.execution_id is not None
+
+        spec = self._registry.get(fresh.tool)
+        if spec is None:
+            raise RecoveryRefused("tool_not_in_registry")
+        if spec.side_effect_free != fresh.side_effect_free:
+            raise RecoveryRefused("side_effect_flag_changed")
+
+        try:
+            args = spec.args_schema.model_validate(fresh.arguments)
+        except ValidationError as exc:
+            raise RecoveryRefused("arguments_no_longer_valid") from exc
+
+        if not authorize(spec, args, run_context).allowed:
+            raise RecoveryRefused("authorization_denied")
+        if not evaluate_policy(spec, args, run_context).allowed:
+            raise RecoveryRefused("policy_denied")
+
+        # The identity must still be a function of the operation being
+        # resumed. If it is not, something between the journal and here
+        # disagrees, and the safe reading is that this is not the same
+        # execution the operator approved.
+        rederived = derive_execution_id(
+            run_context.run_id,
+            fresh.step_id,
+            fresh.attempt,
+            spec.name,
+            args.model_dump(mode="json"),
+        )
+        if rederived != fresh.execution_id:
+            raise RecoveryRefused("execution_identity_mismatch")
+        if decision.expected_execution_id != rederived:
+            raise RecoveryRefused("execution_identity_mismatch")
+
+        return _ResumeSeed(
+            spec=spec,
+            args=args,
+            step_id=fresh.step_id,
+            attempt=fresh.attempt,
+            execution_id=rederived,
+        )
 
     def _enter(self, machine: Run, recorder: EventRecorder, state: State) -> None:
         machine.advance(state)

@@ -106,6 +106,16 @@ class RunJournal:
     def sequence(self) -> int:
         return self._seq
 
+    def records(self) -> list[tuple[int, DurableRecord]]:
+        """Read back this run's durable records, fully verified.
+
+        Exists so the controller never has to hold a path. Reading is a
+        filesystem operation and this is the module that holds that grant;
+        handing the caller a `Path` to open would move the capability one layer
+        up, which is exactly what the per-module grant exists to prevent.
+        """
+        return read_records(self._path)
+
     # -- append -----------------------------------------------------------
 
     def append(self, record: DurableRecord) -> int:

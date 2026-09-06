@@ -38,6 +38,18 @@ MAX_EVENTS_PER_RUN = 1_000
 MAX_RECORD_BYTES = 65_536
 MAX_ARGUMENTS_BYTES = 16_384
 
+# Milestone 6 ceilings for the operator control plane. An operator decision is
+# durable, so an unbounded number of them is unbounded storage, and an
+# unbounded reason string is an unbounded field in an append-only file.
+MAX_OPERATOR_DECISIONS_PER_RUN = 20
+
+# An operator-supplied reason is a *stable slug*, not prose. The charset is the
+# enforcement: with no spaces, no punctuation, and no uppercase, the field
+# structurally cannot carry a sentence, an instruction, or a prompt-injection
+# payload. That is a stronger property than filtering one, and it is why the
+# operator gets a code rather than a free-text field (task 15/19).
+REASON_CODE_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
+
 # A run id must be safe to use as a filename component: the journal for a run
 # is named after it, and a value containing "/" or ".." would otherwise choose
 # where the journal is written. Bounded, and restricted to a key-safe charset.
@@ -63,7 +75,29 @@ RecordType = Literal[
     "run_started",
     "execution_authorized",
     "execution_completed",
+    "operator_decision",
     "run_terminal",
+]
+
+# What an operator may decide about a recovery plan. Deliberately a closed
+# set of controller-understood actions rather than a string the controller
+# interprets: an unknown action has no branch to reach, so it fails closed at
+# the schema rather than at a dispatch table someone might later widen.
+#
+# `inspect` is absent on purpose. Inspection persists nothing and decides
+# nothing, so it is a read on the operator API rather than a durable decision.
+OperatorAction = Literal[
+    # Re-run the *original* authorized execution. Offered only when the
+    # controller has established that repeating it adds no further effect.
+    "resume",
+    # Stop the run. Terminal, and explicitly not a tool failure.
+    "abort",
+    # Close a run the controller cannot complete. Terminal.
+    "terminalize",
+    # Decline this plan without ending the run. Non-terminal, recorded.
+    "reject_recovery",
+    # Note that the plan was seen. Non-terminal, recorded, grants nothing.
+    "acknowledge",
 ]
 
 # The outcome of one physical execution attempt, as the controller observed it.
@@ -112,6 +146,24 @@ def derive_execution_id(
         }
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def derive_plan_id(material: dict[str, Any]) -> str:
+    """Content-address one recovery plan.
+
+    The same technique as `derive_execution_id`, for the same reason: the
+    controller recomputes a plan's identity from the journal every time, so an
+    operator cannot construct a plan of their own and have it believed. A
+    decision names a `plan_id`; if that id does not equal the id the
+    controller just derived from the records, the decision is refused.
+
+    It also makes staleness structural rather than a rule someone has to
+    remember to apply. The material includes the number of decisions already
+    recorded, so recording *any* decision changes the plan's identity and
+    every earlier approval stops matching — an approval cannot be replayed
+    against the plan it created, let alone a later one.
+    """
+    return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()[:32]
 
 
 def checksum(payload: str) -> str:
@@ -172,23 +224,63 @@ class ExecutionCompleted(_Record):
     reason: str | None = Field(default=None, max_length=128)
 
 
+class OperatorDecisionRecorded(_Record):
+    """One explicit operator decision about one controller-generated plan.
+
+    Durable because the decision is authority-adjacent: it is the evidence
+    that a human was asked and answered, and the thing that stops the same
+    approval being used twice. It is deliberately *not* an authorization —
+    the controller re-derives every execution fact for itself and re-runs
+    every gate before acting, so this record grants nothing on its own.
+
+    Note what is absent: no operator identity, no free text, no host detail,
+    no plan body. The project has no authentication model to attribute a
+    decision to (see docs/milestone-6-decisions.md), and inventing an
+    unauthenticated `operator` field would record a claim while implying a
+    verified fact.
+    """
+
+    type: Literal["operator_decision"] = "operator_decision"
+    schema_version: int = SCHEMA_VERSION
+    run_id: str = Field(pattern=RUN_ID_PATTERN)
+    # Monotonic per run, and strictly increasing. This is what bounds duplicate
+    # resumes: a decision at or below the highest recorded sequence is refused,
+    # so one approval authorizes at most one resume attempt.
+    decision_sequence: int = Field(ge=1, le=MAX_OPERATOR_DECISIONS_PER_RUN)
+    action: OperatorAction
+    # The plan this decision was made about, as the controller derived it.
+    plan_id: str = Field(min_length=32, max_length=32)
+    # The execution the plan concerned, when it concerned one at all.
+    expected_execution_id: str | None = Field(default=None, min_length=32, max_length=32)
+    reason_code: str = Field(pattern=REASON_CODE_PATTERN)
+
+
 class RunTerminal(_Record):
-    """The run ended. Recovery must never restart execution past this."""
+    """The run ended. Recovery must never restart execution past this.
+
+    `aborted` is distinct from `failed` on purpose. A failure is something the
+    tool or the model did; an abort is something the operator decided, and
+    collapsing the two would lose the difference between "this went wrong" and
+    "a human stopped it" in the only record that survives the process.
+    """
 
     type: Literal["run_terminal"] = "run_terminal"
     schema_version: int = SCHEMA_VERSION
     run_id: str = Field(pattern=RUN_ID_PATTERN)
-    status: Literal["succeeded", "failed"]
+    status: Literal["succeeded", "failed", "aborted"]
     code: str | None = Field(default=None, max_length=64)
     attempts: int = Field(ge=1, le=100)
 
 
-DurableRecord = RunStarted | ExecutionAuthorized | ExecutionCompleted | RunTerminal
+DurableRecord = (
+    RunStarted | ExecutionAuthorized | ExecutionCompleted | OperatorDecisionRecorded | RunTerminal
+)
 
 _RECORD_TYPES: dict[str, type[_Record]] = {
     "run_started": RunStarted,
     "execution_authorized": ExecutionAuthorized,
     "execution_completed": ExecutionCompleted,
+    "operator_decision": OperatorDecisionRecorded,
     "run_terminal": RunTerminal,
 }
 
@@ -239,7 +331,12 @@ class EnvelopedRecord(_Record):
             raise JournalError("record_schema_invalid") from exc
 
         assert isinstance(
-            parsed, RunStarted | ExecutionAuthorized | ExecutionCompleted | RunTerminal
+            parsed,
+            RunStarted
+            | ExecutionAuthorized
+            | ExecutionCompleted
+            | OperatorDecisionRecorded
+            | RunTerminal,
         )
         return parsed
 

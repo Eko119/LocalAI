@@ -27,6 +27,13 @@ path: authoritative state is never silently corrected.
 `ToolSpec.executor`. It reconstructs what the records say happened; it cannot
 make anything happen, so a corrupted or malicious journal cannot turn an
 audit into an action.
+
+**Planning does not execute either (Milestone 6).** A `RecoveryPlan` now
+carries an identity and the closed set of actions an operator may take, but it
+is still only a description. The plan is *content-addressed*: its id is derived
+from the same records every time, so an operator cannot construct a plan and
+have it believed, and the id changes the moment any decision is recorded — an
+approval therefore cannot be replayed against the plan that produced it.
 """
 
 from __future__ import annotations
@@ -34,18 +41,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .persistence.records import (
+    MAX_OPERATOR_DECISIONS_PER_RUN,
+    SCHEMA_VERSION,
     DurableRecord,
     ExecutionAuthorized,
     ExecutionCompleted,
+    OperatorAction,
+    OperatorDecisionRecorded,
     RunStarted,
     RunTerminal,
     derive_execution_id,
+    derive_plan_id,
 )
-from .policy import RunContext
-from .registry import ToolRegistry
+from .policy import RunContext, authorize, evaluate_policy
+from .registry import ToolRegistry, ToolSpec
 from .state_machine import State
 
 Disposition = Literal[
@@ -64,6 +76,25 @@ Disposition = Literal[
 ]
 
 
+# The controller's stable explanation of *why* a run is in this state. A code,
+# not prose: it is written to the journal, shown to an operator, and compared
+# in tests, and every one of those wants a value that does not drift.
+DISPOSITION_REASONS: dict[Disposition, str] = {
+    "terminal": "run_already_terminal",
+    "no_execution_authorized": "no_execution_was_authorized",
+    "execution_completed": "execution_completed_without_retained_result",
+    "execution_pending_repeatable": "execution_pending_and_repeatable",
+    "execution_unknown": "execution_outcome_unknown",
+}
+
+# Actions that decide nothing about execution: they record that a human looked
+# at the plan. Available wherever a run is not already terminal.
+_PASSIVE_ACTIONS: tuple[OperatorAction, ...] = ("acknowledge", "reject_recovery")
+
+# Actions that end a run without executing anything.
+_TERMINATING_ACTIONS: tuple[OperatorAction, ...] = ("abort", "terminalize")
+
+
 class RecoveryError(Exception):
     """Recovery refused to trust the journal. Always fatal; never repaired."""
 
@@ -74,35 +105,74 @@ class RecoveryError(Exception):
 
 @dataclass(frozen=True)
 class RecoveryPlan:
-    """What a crashed run is permitted to do next, and on what evidence."""
+    """What a crashed run is permitted to do next, and on what evidence.
+
+    Immutable, controller-generated, and content-addressed. An operator reads
+    one and picks an action from `available_actions`; they never construct one,
+    never edit one, and cannot make the controller believe one they built
+    themselves — `plan_id` is re-derived from the journal on every use and
+    compared against the id the decision names.
+    """
 
     run_id: str
     disposition: Disposition
     max_attempts: int
     records_examined: int
+    # -- identity -----------------------------------------------------------
+    # Derived from every field below that decides what is being approved. Any
+    # change to those — including a decision being recorded — changes the id.
+    plan_id: str = ""
+    plan_schema_version: int = SCHEMA_VERSION
+    reason_code: str = ""
+    # -- the execution this plan concerns, if any ---------------------------
     attempt: int | None = None
+    step_id: str | None = None
     tool: str | None = None
     arguments: dict[str, Any] | None = None
     execution_id: str | None = None
     side_effect_free: bool | None = None
     execution_status: str | None = None
+    # -- terminal facts, if the run already ended ---------------------------
     terminal_status: str | None = None
     terminal_code: str | None = None
     terminal_attempts: int | None = None
+    # -- operator control plane ---------------------------------------------
+    # Exactly the actions valid for this controller-derived state. An action
+    # absent from this tuple has no code path, not merely no permission.
+    available_actions: tuple[OperatorAction, ...] = ()
+    # How many decisions this run has already recorded, and therefore which
+    # sequence the next one must carry. Both are controller-derived; an
+    # operator who picks their own sequence is refused.
+    decisions_recorded: int = 0
+    next_decision_sequence: int = 1
+    last_action: OperatorAction | None = None
+    # Whether the original operation still passes AUTHORIZE and POLICY *now*,
+    # against the live registry and the live RunContext. A run whose grants
+    # were narrowed after the crash is not resumable, and this is where that
+    # is decided rather than at the executor.
+    authorization_valid: bool = False
 
     @property
     def may_execute(self) -> bool:
         """Whether recovery is allowed to invoke an executor.
 
-        True in exactly one case: an authorized, uncompleted execution of a
-        tool whose repetition has no additional effect.
+        Note this is now a statement about the *plan*, not a permission: it is
+        true only where the controller both established that repeating the
+        execution adds no further effect and re-confirmed the gates. An
+        operator decision is still required on top of it; nothing executes
+        because this is true.
         """
-        return self.disposition == "execution_pending_repeatable"
+        return "resume" in self.available_actions
 
     @property
     def requires_operator(self) -> bool:
         """Whether a human must decide, because the system cannot know."""
         return self.disposition == "execution_unknown"
+
+    @property
+    def is_terminal(self) -> bool:
+        """A terminal run offers no actions at all. Terminality is immutable."""
+        return self.disposition == "terminal"
 
 
 @dataclass(frozen=True)
@@ -117,6 +187,10 @@ class ReplayResult:
     terminal_status: str | None
     terminal_code: str | None
     attempts: int | None
+    # Milestone 6: the operator decisions the run recorded, in order. Actions
+    # and sequences only — no reason codes, no plan bodies. A replay is a
+    # reconstruction of control flow, not a transcript of the control plane.
+    operator_actions: tuple[OperatorAction, ...] = ()
 
 
 def _validate_sequence(records: list[tuple[int, DurableRecord]], run_context: RunContext) -> str:
@@ -153,8 +227,13 @@ def _validate_sequence(records: list[tuple[int, DurableRecord]], run_context: Ru
 
 def _validate_authorization(
     record: ExecutionAuthorized, registry: ToolRegistry, run_context: RunContext
-) -> None:
-    """Re-derive and re-validate everything the record claims."""
+) -> tuple[ToolSpec, BaseModel]:
+    """Re-derive and re-validate everything the record claims.
+
+    Returns the live `ToolSpec` and the re-validated arguments so the caller
+    can run the gates against them. Note the direction: the record is checked
+    *against* the live registry, never the other way round.
+    """
     if not 1 <= record.attempt <= run_context.max_attempts:
         raise RecoveryError("journal_attempt_out_of_range")
 
@@ -187,22 +266,97 @@ def _validate_authorization(
     if expected != record.execution_id:
         raise RecoveryError("journal_execution_id_mismatch")
 
+    return spec, args
+
+
+def _validate_decisions(
+    records: list[tuple[int, DurableRecord]],
+) -> list[OperatorDecisionRecorded]:
+    """Structural checks over the operator decisions in a journal.
+
+    Sequences must start at 1 and increase by exactly one. A gap would let a
+    journal be edited to make a *future* sequence look already-used, and a
+    repeat would let one approval stand in for two.
+    """
+    decisions = [record for _, record in records if isinstance(record, OperatorDecisionRecorded)]
+    if len(decisions) > MAX_OPERATOR_DECISIONS_PER_RUN:
+        raise RecoveryError("journal_operator_decision_ceiling_exceeded")
+    for index, decision in enumerate(decisions, start=1):
+        if decision.decision_sequence != index:
+            raise RecoveryError("journal_operator_decision_sequence_invalid")
+    return decisions
+
+
+def _available_actions(
+    disposition: Disposition, *, authorization_valid: bool, decisions: int
+) -> tuple[OperatorAction, ...]:
+    """The closed set of actions valid for this controller-derived state.
+
+    Three deliberate restrictions live here, and each is a fail-closed choice:
+
+    * a **terminal** run offers nothing at all, so there is no action an
+      operator could take that would resurrect it;
+    * **`execution_unknown` does not offer `resume`.** The tool is not
+      side-effect free and the journal cannot say whether the effect happened,
+      so re-running it might duplicate a real side effect. The operator is not
+      permitted to overrule that, because doing so would be exactly the
+      "operator changes `side_effect_free`" move the threat model forbids. The
+      cost is real: an operator who *knows* the effect did not happen still
+      cannot resume, and must start a new run instead;
+    * **`execution_completed` does not offer `resume`.** The physical call
+      finished, but the journal deliberately never stored the result, so the
+      run cannot be verified without executing a second time.
+    """
+    if disposition == "terminal":
+        return ()
+    if decisions >= MAX_OPERATOR_DECISIONS_PER_RUN:
+        # The control plane is bounded like everything else that persists.
+        return ()
+    actions: tuple[OperatorAction, ...] = ()
+    if disposition == "execution_pending_repeatable" and authorization_valid:
+        actions += ("resume",)
+    return actions + _TERMINATING_ACTIONS + _PASSIVE_ACTIONS
+
+
+def _plan_identity(fields: dict[str, Any]) -> str:
+    """Derive a plan id from every field that decides what is being approved."""
+    return derive_plan_id({"plan_schema_version": SCHEMA_VERSION, **fields})
+
+
+def _build_plan(**fields: Any) -> RecoveryPlan:
+    """Assemble a plan and stamp it with its own content address.
+
+    The id covers the whole plan, `decisions_recorded` included. That is what
+    makes staleness structural: recording any decision changes the plan, so the
+    approval that produced it no longer names a plan that exists.
+    """
+    material = {key: value for key, value in fields.items() if key != "records_examined"}
+    material["available_actions"] = list(fields.get("available_actions", ()))
+    return RecoveryPlan(plan_id=_plan_identity(material), **fields)
+
 
 def plan_recovery(
     records: list[tuple[int, DurableRecord]],
     registry: ToolRegistry,
     run_context: RunContext,
 ) -> RecoveryPlan:
-    """Decide what a crashed run may do next. Pure; contacts nothing."""
+    """Decide what a crashed run may do next. Pure; contacts nothing.
+
+    Reads the journal, re-validates every record against live authority, and
+    returns a description. It invokes no executor, calls no model, and mutates
+    nothing — acting on the plan is a separate, explicitly authorized step.
+    """
     run_id = _validate_sequence(records, run_context)
+    decisions = _validate_decisions(records)
 
     authorizations: dict[str, ExecutionAuthorized] = {}
     completions: dict[str, ExecutionCompleted] = {}
+    validated: dict[str, tuple[ToolSpec, BaseModel]] = {}
     terminal: RunTerminal | None = None
 
     for _, record in records:
         if isinstance(record, ExecutionAuthorized):
-            _validate_authorization(record, registry, run_context)
+            validated[record.execution_id] = _validate_authorization(record, registry, run_context)
             if record.execution_id in authorizations:
                 raise RecoveryError("journal_duplicate_authorization")
             authorizations[record.execution_id] = record
@@ -218,13 +372,25 @@ def plan_recovery(
             terminal = record
 
     examined = len(records)
+    recorded = len(decisions)
+    common: dict[str, Any] = {
+        "run_id": run_id,
+        "max_attempts": run_context.max_attempts,
+        "records_examined": examined,
+        "decisions_recorded": recorded,
+        "next_decision_sequence": recorded + 1,
+        "last_action": decisions[-1].action if decisions else None,
+    }
 
     if terminal is not None:
-        return RecoveryPlan(
-            run_id=run_id,
-            max_attempts=run_context.max_attempts,
-            records_examined=examined,
+        return _build_plan(
+            **common,
             disposition="terminal",
+            reason_code=DISPOSITION_REASONS["terminal"],
+            available_actions=_available_actions(
+                "terminal", authorization_valid=False, decisions=recorded
+            ),
+            authorization_valid=False,
             terminal_status=terminal.status,
             terminal_code=terminal.code,
             terminal_attempts=terminal.attempts,
@@ -243,16 +409,29 @@ def plan_recovery(
 
     if pending:
         authorization = pending[0]
-        return RecoveryPlan(
-            run_id=run_id,
-            max_attempts=run_context.max_attempts,
-            records_examined=examined,
-            disposition=(
-                "execution_pending_repeatable"
-                if authorization.side_effect_free
-                else "execution_unknown"
+        disposition: Disposition = (
+            "execution_pending_repeatable"
+            if authorization.side_effect_free
+            else "execution_unknown"
+        )
+        spec, args = validated[authorization.execution_id]
+        # The gates are re-run here, not merely remembered. A run whose grants
+        # or policy ceilings were narrowed after the crash must not be offered
+        # a resume it would only be refused at EXECUTE.
+        valid = (
+            authorize(spec, args, run_context).allowed
+            and evaluate_policy(spec, args, run_context).allowed
+        )
+        return _build_plan(
+            **common,
+            disposition=disposition,
+            reason_code=DISPOSITION_REASONS[disposition],
+            available_actions=_available_actions(
+                disposition, authorization_valid=valid, decisions=recorded
             ),
+            authorization_valid=valid,
             attempt=authorization.attempt,
+            step_id=authorization.step_id,
             tool=authorization.tool,
             arguments=authorization.arguments,
             execution_id=authorization.execution_id,
@@ -263,12 +442,16 @@ def plan_recovery(
         last_id = list(authorizations)[-1]
         completion = completions[last_id]
         authorization = authorizations[last_id]
-        return RecoveryPlan(
-            run_id=run_id,
-            max_attempts=run_context.max_attempts,
-            records_examined=examined,
+        return _build_plan(
+            **common,
             disposition="execution_completed",
+            reason_code=DISPOSITION_REASONS["execution_completed"],
+            available_actions=_available_actions(
+                "execution_completed", authorization_valid=False, decisions=recorded
+            ),
+            authorization_valid=False,
             attempt=authorization.attempt,
+            step_id=authorization.step_id,
             tool=authorization.tool,
             arguments=authorization.arguments,
             execution_id=last_id,
@@ -276,11 +459,14 @@ def plan_recovery(
             execution_status=completion.status,
         )
 
-    return RecoveryPlan(
-        run_id=run_id,
-        max_attempts=run_context.max_attempts,
-        records_examined=examined,
+    return _build_plan(
+        **common,
         disposition="no_execution_authorized",
+        reason_code=DISPOSITION_REASONS["no_execution_authorized"],
+        available_actions=_available_actions(
+            "no_execution_authorized", authorization_valid=False, decisions=recorded
+        ),
+        authorization_valid=False,
     )
 
 
@@ -304,6 +490,7 @@ def replay(
     record_types: list[str] = []
     execution_ids: list[str] = []
     completed = 0
+    operator_actions: list[OperatorAction] = []
     terminal_status: str | None = None
     terminal_code: str | None = None
     attempts: int | None = None
@@ -326,6 +513,11 @@ def replay(
         elif isinstance(record, ExecutionCompleted):
             completed += 1
             states.append(State.VERIFY if record.status == "succeeded" else State.FEEDBACK)
+        elif isinstance(record, OperatorDecisionRecorded):
+            # A decision is not a state transition. Recording one moves nothing
+            # through the state machine; only acting on it does, and acting is
+            # the controller's job, not replay's.
+            operator_actions.append(record.action)
         elif isinstance(record, RunTerminal):
             terminal_status = record.status
             terminal_code = record.code
@@ -341,4 +533,5 @@ def replay(
         terminal_status=terminal_status,
         terminal_code=terminal_code,
         attempts=attempts,
+        operator_actions=tuple(operator_actions),
     )

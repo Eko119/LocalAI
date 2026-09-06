@@ -42,7 +42,9 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
 | `test_live_localai.py` | opt-in live scenarios; skipped unless `LOCAL_AGENT_LIVE_MODEL` is set |
 | `test_persistence.py` | the durable boundary: round trip, identity derivation, fsync ordering, locking, ceilings, and the corruption matrix |
 | `test_recovery.py` | crash windows A–F with measured execution counts, the recovery matrix, adversarial journal mutations, and that replay executes nothing |
-| `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem, model, and recovery scenario |
+| `test_operator.py` | the control plane: plan identity, approval binding, staleness, the adversarial operator matrix, terminality, inspection, ceilings |
+| `test_operator_recovery.py` | recovery end to end: 13 crash windows, safe resume, revalidation, abort semantics, concurrency, model-context security, transparency |
+| `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem, model, recovery, and operator scenario |
 | `test_controller_flow.py` | gate ordering, audit events, budget arithmetic |
 | `test_architecture.py` | the capability boundary, enforced against the package AST |
 
@@ -97,6 +99,19 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
    disposition: the question "did the side effect happen" is answered by
    counting executor invocations, and a test that only checks the returned plan
    would pass even if recovery had re-run a non-repeatable tool.
-14. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
+14. **An operator test asserts the refusal *and* the two counters.** Not just
+   that the decision was rejected: `executor.call_count == 0` and
+   `adapter.call_count == 0`. A rejection returned after a side effect, or
+   after a model call, is not a rejection.
+15. **A model-leak test uses sentinels, not eyeballs.** Put a unique value in
+   the plan id, the execution id and the reason code, then assert it is absent
+   from everything the adapter was sent. Reading the payload and deciding it
+   looks fine proves nothing about the next change.
+16. **A boundary scan needs a positive control.** Every AST check that asserts
+   an absence has a sibling that poisons a copy and proves the same predicate
+   fires. Without it a scanner that silently stopped working would make every
+   assertion pass vacuously — `test_the_operator_boundary_check_actually_catches_a_violation`
+   is the pattern.
+17. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
    `mypy`) pass before a change is done. CI runs the same ones in the same
    order.

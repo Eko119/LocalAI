@@ -42,10 +42,13 @@ from local_agent.model_adapter import (
     ModelTransportTimeout,
 )
 from local_agent.model_transport import TransportResponse
+from local_agent.operator import inspect_run, render_inspection
 from local_agent.persistence.records import (
     DurableRecord,
     ExecutionAuthorized,
     ExecutionCompleted,
+    OperatorAction,
+    OperatorDecisionRecorded,
     RunStarted,
     RunTerminal,
     derive_execution_id,
@@ -525,3 +528,164 @@ def test_serialized_records_are_byte_stable_across_processes() -> None:
         rebuilt = list(enumerate(_recovery_scenarios()[name]))
         second = [envelope(record, seq) for seq, record in rebuilt]
         assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Milestone 6: operator-controlled recovery determinism
+# ---------------------------------------------------------------------------
+#
+# Same discipline as the Milestone 5 block: journals are constructed in memory
+# from explicit records, so nothing here depends on a filesystem, a clock, or
+# `new_run_id()`. The fingerprint deliberately covers the *control plane*
+# artifacts a Milestone 6 regression would move — the plan identity, the
+# available actions, the operator decisions, the disposition — alongside the
+# Milestone 5 ones it must not disturb.
+
+OPERATOR_REPETITIONS = 100
+
+
+def _decision(
+    sequence: int, action: OperatorAction, plan_id: str = "d" * 32
+) -> OperatorDecisionRecorded:
+    return OperatorDecisionRecorded(
+        run_id=_RECOVERY_RUN,
+        decision_sequence=sequence,
+        action=action,
+        plan_id=plan_id,
+        expected_execution_id=_RECOVERY_EID,
+        reason_code="deterministic_fixture",
+    )
+
+
+def _operator_scenarios() -> dict[str, list[DurableRecord]]:
+    """One journal per operator-controlled outcome, built without any I/O."""
+    started = RunStarted(run_id=_RECOVERY_RUN, max_attempts=3)
+    completed = ExecutionCompleted(
+        run_id=_RECOVERY_RUN, execution_id=_RECOVERY_EID, status="succeeded"
+    )
+    return {
+        "01_awaiting_decision": [started, _authorization()],
+        "02_acknowledged_not_acted_on": [started, _authorization(), _decision(1, "acknowledge")],
+        "03_recovery_rejected": [started, _authorization(), _decision(1, "reject_recovery")],
+        "04_approved_and_resumed": [
+            started,
+            _authorization(),
+            _decision(1, "resume"),
+            completed,
+            RunTerminal(run_id=_RECOVERY_RUN, status="succeeded", attempts=1),
+        ],
+        "05_operator_abort": [
+            started,
+            _authorization(),
+            _decision(1, "abort"),
+            RunTerminal(run_id=_RECOVERY_RUN, status="aborted", code="OPERATOR_ABORT", attempts=1),
+        ],
+        "06_operator_terminalized": [
+            started,
+            _authorization(),
+            _decision(1, "terminalize"),
+            RunTerminal(
+                run_id=_RECOVERY_RUN, status="failed", code="OPERATOR_TERMINALIZED", attempts=1
+            ),
+        ],
+        "07_two_decisions_then_abort": [
+            started,
+            _authorization(),
+            _decision(1, "acknowledge"),
+            _decision(2, "abort"),
+            RunTerminal(run_id=_RECOVERY_RUN, status="aborted", code="OPERATOR_ABORT", attempts=1),
+        ],
+    }
+
+
+def _operator_fingerprint(scenario: str) -> str:
+    records = list(enumerate(_operator_scenarios()[scenario]))
+    registry = build_default_registry(FakeFileSearchExecutor())
+    context = RunContext(run_id=_RECOVERY_RUN)
+
+    plan = plan_recovery(records, registry, context)
+    result = replay(records, registry, context)
+    inspection = inspect_run(records, registry, context)
+
+    return json.dumps(
+        {
+            "plan": {
+                "plan_id": plan.plan_id,
+                "disposition": plan.disposition,
+                "reason_code": plan.reason_code,
+                "available_actions": list(plan.available_actions),
+                "may_execute": plan.may_execute,
+                "requires_operator": plan.requires_operator,
+                "is_terminal": plan.is_terminal,
+                "authorization_valid": plan.authorization_valid,
+                "decisions_recorded": plan.decisions_recorded,
+                "next_decision_sequence": plan.next_decision_sequence,
+                "last_action": plan.last_action,
+                "execution_id": plan.execution_id,
+                "tool": plan.tool,
+                "arguments": plan.arguments,
+                "attempt": plan.attempt,
+                "step_id": plan.step_id,
+                "terminal_status": plan.terminal_status,
+                "terminal_code": plan.terminal_code,
+            },
+            "replay": {
+                "states": [state.value for state in result.states],
+                "record_types": list(result.record_types),
+                "execution_ids": list(result.execution_ids),
+                "executions_completed": result.executions_completed,
+                "operator_actions": list(result.operator_actions),
+                "terminal_status": result.terminal_status,
+            },
+            # The operator-facing rendering must be stable too: it is the
+            # surface a machine consumer would diff between inspections.
+            "inspection": render_inspection(inspection),
+            "serialized": [envelope(record, seq) for seq, record in records],
+        },
+        sort_keys=True,
+    )
+
+
+@pytest.mark.parametrize("scenario", sorted(_operator_scenarios()))
+def test_operator_recovery_is_identical_across_repetitions(scenario: str) -> None:
+    baseline = _operator_fingerprint(scenario)
+    fingerprints = {_operator_fingerprint(scenario) for _ in range(OPERATOR_REPETITIONS)}
+
+    assert fingerprints == {baseline}, f"{scenario} diverged across {OPERATOR_REPETITIONS} runs"
+
+
+def test_operator_scenarios_are_distinguishable() -> None:
+    """Without this, seven identical fingerprints would pass vacuously."""
+    fingerprints = {name: _operator_fingerprint(name) for name in _operator_scenarios()}
+    assert len(set(fingerprints.values())) == len(fingerprints)
+
+
+def test_a_recorded_decision_always_changes_the_plan_identity() -> None:
+    """The staleness mechanism, asserted as a property rather than a case."""
+    scenarios = _operator_scenarios()
+    registry = build_default_registry(FakeFileSearchExecutor())
+    context = RunContext(run_id=_RECOVERY_RUN)
+
+    before = plan_recovery(
+        list(enumerate(scenarios["01_awaiting_decision"])), registry, context
+    ).plan_id
+    after = plan_recovery(
+        list(enumerate(scenarios["02_acknowledged_not_acted_on"])), registry, context
+    ).plan_id
+    assert before != after
+
+
+def test_operator_fingerprints_carry_no_timestamp_or_host_detail() -> None:
+    for name in _operator_scenarios():
+        fingerprint = _operator_fingerprint(name).lower()
+        for forbidden in ("timestamp", "created_at", "/tmp", "/home", "0x", "127.0.0.1", "sk-"):
+            assert forbidden not in fingerprint, f"{name} leaked {forbidden}"
+
+
+def test_operator_replay_never_executes_across_every_scenario() -> None:
+    """Milestone 5's zero-execution property, re-proved with the new record type."""
+    for name, records in _operator_scenarios().items():
+        spy = FakeFileSearchExecutor()
+        registry = build_default_registry(spy)
+        replay(list(enumerate(records)), registry, RunContext(run_id=_RECOVERY_RUN))
+        assert spy.call_count == 0, f"{name} executed during replay"
