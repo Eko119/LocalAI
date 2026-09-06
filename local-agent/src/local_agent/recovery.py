@@ -57,7 +57,7 @@ from .persistence.records import (
     derive_plan_id,
 )
 from .policy import RunContext, authorize, evaluate_policy
-from .registry import ToolRegistry, ToolSpec
+from .registry import ToolRegistry, ToolSpec, capability_digest
 from .state_machine import State
 
 Disposition = Literal[
@@ -132,6 +132,14 @@ class RecoveryPlan:
     execution_id: str | None = None
     side_effect_free: bool | None = None
     execution_status: str | None = None
+    # Milestone 7. The capability's content address as recorded at
+    # authorization, and whether it could be compared against the live
+    # definition at all. `False` means the record predates capability digests,
+    # not that a comparison failed — a mismatch is fatal and never reaches a
+    # plan. Keeping the two apart is the difference between "verified" and
+    # "unverifiable", which an operator deciding on a resume needs to know.
+    capability_digest: str | None = None
+    capability_verified: bool = False
     # -- terminal facts, if the run already ended ---------------------------
     terminal_status: str | None = None
     terminal_code: str | None = None
@@ -253,6 +261,19 @@ def _validate_authorization(
     # the authority for that, and a disagreement means the record was altered.
     if record.side_effect_free != spec.side_effect_free:
         raise RecoveryError("journal_side_effect_flag_mismatch")
+
+    # The capability's *definition* must be the one that was authorized
+    # (Milestone 7). This catches what nothing else does: a schema widened, a
+    # timeout raised, an authorization requirement dropped — changes that leave
+    # the recorded arguments valid and the execution identity intact while
+    # meaning something different from what the run was granted.
+    #
+    # A record with no digest predates the field. It is *not* treated as
+    # verified: `plan_recovery` reports `capability_verified=False` so the
+    # difference between "checked and matched" and "could not be checked" stays
+    # visible to whoever is deciding what to do next.
+    if record.capability_digest is not None and record.capability_digest != capability_digest(spec):
+        raise RecoveryError("journal_capability_digest_mismatch")
 
     # Re-derivation is what makes an altered tool name, argument, or attempt
     # detectable without needing an authenticated log.
@@ -436,6 +457,8 @@ def plan_recovery(
             arguments=authorization.arguments,
             execution_id=authorization.execution_id,
             side_effect_free=authorization.side_effect_free,
+            capability_digest=authorization.capability_digest,
+            capability_verified=authorization.capability_digest is not None,
         )
 
     if authorizations:
@@ -457,6 +480,8 @@ def plan_recovery(
             execution_id=last_id,
             side_effect_free=authorization.side_effect_free,
             execution_status=completion.status,
+            capability_digest=authorization.capability_digest,
+            capability_verified=authorization.capability_digest is not None,
         )
 
     return _build_plan(

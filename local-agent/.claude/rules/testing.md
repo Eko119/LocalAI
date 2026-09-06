@@ -44,6 +44,7 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
 | `test_recovery.py` | crash windows A–F with measured execution counts, the recovery matrix, adversarial journal mutations, and that replay executes nothing |
 | `test_operator.py` | the control plane: plan identity, approval binding, staleness, the adversarial operator matrix, terminality, inspection, ceilings |
 | `test_operator_recovery.py` | recovery end to end: 13 crash windows, safe resume, revalidation, abort semantics, concurrency, model-context security, transparency |
+| `test_capability.py` | the capability contract: the admission matrix, immutability including nested, capability identity, the side-effect/retry/idempotency matrix (cases A–H), executor isolation, the result boundary, authority-named model fields, and the runtime secret sentinels |
 | `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem, model, recovery, and operator scenario |
 | `test_controller_flow.py` | gate ordering, audit events, budget arithmetic |
 | `test_architecture.py` | the capability boundary, enforced against the package AST |
@@ -112,6 +113,24 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
    fires. Without it a scanner that silently stopped working would make every
    assertion pass vacuously — `test_the_operator_boundary_check_actually_catches_a_violation`
    is the pattern.
-17. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
+17. **A security property is proven by mutation, not by assertion.** Break the
+   real implementation, confirm a named test fails, restore it byte-for-byte,
+   confirm the suite is green again. Milestone 7 did this for eleven mutations
+   — the admission gate, the registry proxy, the attribute guard, the retry
+   gate, both derived properties, the digest check, the coherence rule, name
+   validation, the executor-protocol check, and a deliberate metadata leak into
+   the model surface. A test nobody has watched fail is a test nobody has
+   verified.
+18. **Watch for a mutation "caught" by a broken selector.** A `-k` expression
+   that matches nothing exits non-zero and looks like a detection. Treat "no
+   tests ran" as an audit failure, not a pass — this happened once and was
+   caught only because the output was read rather than the exit code.
+19. **A refusal test names the reason.** Every admission failure asserts a
+   stable slug rather than a message, so the matrix is testable by outcome and
+   a reworded error does not silently pass the wrong check.
+20. **Assert the limitation too.** `test_the_schema_classes_a_spec_points_at_remain_mutable`
+   exists to keep a real weakness visible. Deleting a test because it documents
+   something uncomfortable is how a known limitation becomes a forgotten one.
+21. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
    `mypy`) pass before a change is done. CI runs the same ones in the same
    order.

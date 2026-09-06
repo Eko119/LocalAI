@@ -108,6 +108,12 @@ class ExecutionView(_Strict):
     execution_id: str
     side_effect_free: bool
     status: str | None = None
+    # Milestone 7: the capability's content address at authorization, and
+    # whether it could be compared with the live definition. An operator
+    # deciding on a resume is told which of "verified" and "unverifiable" they
+    # are looking at, rather than being shown one and left to assume the other.
+    capability_digest: str | None = None
+    capability_verified: bool = False
 
 
 class RunInspection(_Strict):
@@ -174,6 +180,8 @@ def inspect_run(
             execution_id=plan.execution_id,
             side_effect_free=plan.side_effect_free,
             status=plan.execution_status,
+            capability_digest=plan.capability_digest,
+            capability_verified=plan.capability_verified,
         )
 
     return RunInspection(

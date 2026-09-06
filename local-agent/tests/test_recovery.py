@@ -45,7 +45,7 @@ from local_agent.persistence.records import (
 )
 from local_agent.policy import RunContext
 from local_agent.recovery import RecoveryError, plan_recovery, replay
-from local_agent.registry import ToolRegistry
+from local_agent.registry import SideEffect, ToolRegistry
 from local_agent.state_machine import State
 from local_agent.wiring import (
     build_default_registry,
@@ -180,7 +180,7 @@ def test_window_c_is_unknown_when_the_tool_is_not_side_effect_free(
     registry = build_default_registry(crashing)
     spec = registry.get("file_search")
     assert spec is not None
-    unsafe = dataclasses.replace(spec, side_effect_free=False)
+    unsafe = dataclasses.replace(spec, side_effect=SideEffect.MUTATING)
     unsafe_registry = ToolRegistry((unsafe,))
 
     import asyncio
@@ -406,7 +406,7 @@ def test_declaring_a_tool_safe_to_repeat_is_refused(tmp_path: Path) -> None:
     registry = build_default_registry(FakeFileSearchExecutor())
     spec = registry.get("file_search")
     assert spec is not None
-    unsafe = ToolRegistry((dataclasses.replace(spec, side_effect_free=False),))
+    unsafe = ToolRegistry((dataclasses.replace(spec, side_effect=SideEffect.MUTATING),))
 
     # The journal says True; the live registry says False.
     with pytest.raises(RecoveryError) as excinfo:

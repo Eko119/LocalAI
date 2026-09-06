@@ -37,6 +37,9 @@ EventType = Literal[
     "execution_failed",
     "verification_failed",
     "retry",
+    # Milestone 7: a retry the budget allowed but the capability contract did
+    # not, because re-running it would compound a side effect.
+    "retry_withheld",
     # Milestone 6: the operator control plane. Structural facts only, as
     # everywhere else — an action name, a plan id, a sequence, a stable reason
     # code. Never an operator identity, never free text.

@@ -57,7 +57,14 @@ from ..contracts import (
     WorkspaceReadResult,
 )
 from ..policy import DEFAULT_FILESYSTEM_LIMITS, LEGAL_ROOT_IDS, FilesystemLimits
-from ..registry import ToolDenialError, ToolExecutionError, ToolExecutor, ToolSpec
+from ..registry import (
+    SideEffect,
+    ToolDenialError,
+    ToolExecutionError,
+    ToolExecutor,
+    ToolSpec,
+    admit,
+)
 
 # Exported so trusted wiring can name a physical root without importing
 # `pathlib` itself. The filesystem grant stays confined to this module.
@@ -309,30 +316,34 @@ class WorkspaceListExecutor:
 
 
 def build_workspace_read_spec(executor: ToolExecutor) -> ToolSpec:
-    """Controller-owned definition of `workspace.read`."""
-    return ToolSpec(
-        name="workspace.read",
-        args_schema=WorkspaceReadArgs,
-        executor=executor,
-        timeout_seconds=5.0,
-        requires_authorization=True,
-        destructive=False,
-        result_schema=WorkspaceReadResult,
-        # Reads produce no side effect, so an ambiguous crash may be
-        # resolved by re-executing (see docs/milestone-5-decisions.md).
-        side_effect_free=True,
+    """Controller-owned definition of `workspace.read`, already admitted."""
+    return admit(
+        ToolSpec(
+            name="workspace.read",
+            args_schema=WorkspaceReadArgs,
+            executor=executor,
+            timeout_seconds=5.0,
+            requires_authorization=True,
+            destructive=False,
+            result_schema=WorkspaceReadResult,
+            # A read observes; it changes nothing. An ambiguous crash may
+            # therefore be resolved by re-executing.
+            side_effect=SideEffect.NONE,
+        )
     )
 
 
 def build_workspace_list_spec(executor: ToolExecutor) -> ToolSpec:
-    """Controller-owned definition of `workspace.list`."""
-    return ToolSpec(
-        name="workspace.list",
-        args_schema=WorkspaceListArgs,
-        executor=executor,
-        timeout_seconds=5.0,
-        requires_authorization=True,
-        destructive=False,
-        result_schema=WorkspaceListResult,
-        side_effect_free=True,
+    """Controller-owned definition of `workspace.list`, already admitted."""
+    return admit(
+        ToolSpec(
+            name="workspace.list",
+            args_schema=WorkspaceListArgs,
+            executor=executor,
+            timeout_seconds=5.0,
+            requires_authorization=True,
+            destructive=False,
+            result_schema=WorkspaceListResult,
+            side_effect=SideEffect.NONE,
+        )
     )

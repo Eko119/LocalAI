@@ -18,7 +18,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from ..contracts import FileSearchArgs, FileSearchResult
-from ..registry import ToolExecutor, ToolSpec
+from ..registry import SideEffect, ToolExecutor, ToolSpec, admit
 
 
 class FakeFileSearchExecutor:
@@ -55,16 +55,23 @@ class FakeFileSearchExecutor:
 
 
 def build_file_search_spec(executor: ToolExecutor | None = None) -> ToolSpec:
-    """The controller-owned definition of the `file_search` tool."""
-    return ToolSpec(
-        name="file_search",
-        args_schema=FileSearchArgs,
-        executor=executor or FakeFileSearchExecutor(),
-        timeout_seconds=5.0,
-        requires_authorization=True,
-        destructive=False,
-        result_schema=FileSearchResult,
-        # Reads produce no side effect, so an ambiguous crash may be
-        # resolved by re-executing (see docs/milestone-5-decisions.md).
-        side_effect_free=True,
+    """The controller-owned definition of the `file_search` capability.
+
+    Returned already admitted: `admit` is the only way into a registry, and
+    running it here means a capability is checked at the moment it is defined
+    rather than at the moment someone remembers to.
+    """
+    return admit(
+        ToolSpec(
+            name="file_search",
+            args_schema=FileSearchArgs,
+            executor=executor or FakeFileSearchExecutor(),
+            timeout_seconds=5.0,
+            requires_authorization=True,
+            destructive=False,
+            result_schema=FileSearchResult,
+            # A search observes; it changes nothing. Both derived properties
+            # follow: nothing happened, and repeating is free.
+            side_effect=SideEffect.NONE,
+        )
     )

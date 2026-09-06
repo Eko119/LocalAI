@@ -44,6 +44,12 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
 | what a recovery plan is | `recovery.plan_recovery` + `derive_plan_id` | a plan the operator submits |
 | whether a decision binds | `operator.validate_decision` | the decision's own say-so |
 | whether a resumed execution may run | `Controller._revalidate_recovery` | a recorded approval alone |
+| whether a capability may exist at all | `registry.admit` | construction succeeding |
+| what a capability *is* | the immutable `ToolSpec` | anything at runtime |
+| whether repeating a capability is safe | `ToolSpec.re_executable` | the error code alone |
+| whether anything observable happened | `ToolSpec.side_effect_free` | the same flag as retry |
+| a capability's identity over time | `registry.capability_digest` | a name alone |
+| which capabilities exist | `wiring` + `ToolRegistry.__init__` | runtime registration |
 
 ## Rules
 
@@ -51,7 +57,9 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
    editing `TRANSITIONS` and its tests, never by adding control flow that
    bypasses `Run.advance`.
 2. **The registry is assembled at startup and never mutated.** `ToolRegistry`
-   has no mutation API; keep it that way.
+   has no mutation API, its map is a `MappingProxyType`, and `__setattr__`
+   refuses rebinding. Keep all three: before Milestone 7 the map was a plain
+   dict and both `_by_name["x"] = spec` and `_by_name = {}` worked.
 3. **The parser reads one field.** `parse_candidate` looks at
    `ModelResponse.structured_output` and nothing else. Never scan `reasoning`
    or `narrative` — not even to filter them. Invisibility beats filtering.
@@ -120,3 +128,22 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
     `--bypass`, `--superuser`, `--emergency`, or any equivalent flag, kwarg or
     environment variable. If recovery is blocked, the answer is a new run, not
     a bypass.
+19. **Admission is unconditional, and there is no "already checked" marker.**
+    `ToolRegistry` runs `admit` on every entry. Never add an `admitted` field
+    or any other mark to skip the check — a mark is a field, and
+    `dataclasses.replace` copies fields onto a spec whose properties have since
+    changed, which is exactly how an unchecked capability would look checked.
+20. **A capability declares what it is, never what it is allowed.**
+    `requires_authorization` and `destructive` describe the capability;
+    `RunContext` decides what this run may do with it. Never let a capability
+    carry a grant, a budget, a root, or a per-run ceiling — and never admit a
+    `destructive` capability that does not require authorization, because
+    `authorize` skips the grant check for it entirely.
+21. **Three-valued side effects, two derived properties.** Never collapse
+    `SideEffect` into a boolean, never store `side_effect_free` or
+    `re_executable`, and never equate either with retryability. The retry
+    branch is `error.retryable AND (nothing ran OR re_executable) AND budget`.
+22. **Detect what you cannot prevent.** A capability's schemas are mutable
+    classes, so `capability_digest` exists because freezing them is impossible.
+    Never describe the digest as a tamper seal, and never treat a missing
+    digest as a verified one.

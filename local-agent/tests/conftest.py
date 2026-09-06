@@ -8,6 +8,7 @@ the controller, because nearly every adversarial assertion is a pair —
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 from collections.abc import Callable, Sequence
@@ -19,7 +20,7 @@ import pytest
 
 from local_agent.contracts import FileSearchArgs, FileSearchResult, ModelResponse
 from local_agent.controller import Controller, RunOutcome
-from local_agent.executors.file_search import FakeFileSearchExecutor
+from local_agent.executors.file_search import FakeFileSearchExecutor, build_file_search_spec
 from local_agent.executors.workspace_fs import (
     PhysicalRoots,
     WorkspaceListExecutor,
@@ -31,7 +32,7 @@ from local_agent.model_service import LocalAIModelAdapter
 from local_agent.model_transport import ScriptedTransport, TransportResponse
 from local_agent.persistence.journal import RunJournal
 from local_agent.policy import DEFAULT_FILESYSTEM_LIMITS, FilesystemLimits, RunContext
-from local_agent.registry import ToolRegistry, ToolSpec
+from local_agent.registry import SideEffect, ToolRegistry, ToolSpec
 from local_agent.wiring import (
     build_default_registry,
     build_filesystem_registry,
@@ -573,13 +574,13 @@ class CrashBeforeExecuteExecutor(RecordingExecutor):
 
 
 def unsafe_file_search_spec(executor: Any) -> ToolSpec:
-    """The `file_search` tool declared *not* safe to repeat.
+    """The `file_search` tool declared `MUTATING` — the fail-closed default.
 
-    Identical to the production spec except for `side_effect_free=False` —
-    the fail-closed default a tool gets when nobody has thought about crash
-    behaviour. It exists so the ambiguity path can be tested without inventing
-    a second tool, and because every tool that ships today is repeatable, which
-    would otherwise leave `execution_unknown` untested against a real run.
+    Identical to the production spec except for its side-effect classification.
+    It exists so the ambiguity path can be tested without inventing a second
+    tool: every capability that ships today is `NONE`, which would otherwise
+    leave `execution_unknown` and the non-re-executable retry path untested
+    against a real controller.
     """
     return ToolSpec(
         name="file_search",
@@ -589,8 +590,32 @@ def unsafe_file_search_spec(executor: Any) -> ToolSpec:
         requires_authorization=True,
         destructive=False,
         result_schema=FileSearchResult,
-        side_effect_free=False,
+        side_effect=SideEffect.MUTATING,
     )
+
+
+def idempotent_file_search_spec(executor: Any) -> ToolSpec:
+    """The `file_search` tool declared `IDEMPOTENT`.
+
+    The classification a boolean cannot express: it *has* an effect, so an
+    ambiguous crash is not "nothing happened", but repeating it converges, so
+    the controller may still retry. Both derived properties differ from the
+    other two specs, which is what makes the three-way distinction testable.
+    """
+    return ToolSpec(
+        name="file_search",
+        args_schema=FileSearchArgs,
+        executor=executor,
+        timeout_seconds=5.0,
+        requires_authorization=True,
+        destructive=False,
+        result_schema=FileSearchResult,
+        side_effect=SideEffect.IDEMPOTENT,
+    )
+
+
+def idempotent_registry(executor: Any) -> ToolRegistry:
+    return ToolRegistry((idempotent_file_search_spec(executor),))
 
 
 def unsafe_registry(executor: Any) -> ToolRegistry:
@@ -619,6 +644,7 @@ def crash_mid_execution(
     *,
     run_id: str = "run-crashed",
     repeatable: bool = True,
+    classification: SideEffect | None = None,
     execute_physically: bool = True,
     responses: Sequence[ModelResponse] | None = None,
 ) -> CrashedRun:
@@ -633,7 +659,15 @@ def crash_mid_execution(
     crasher: Any = (
         CrashingExecutor(inner) if execute_physically else CrashBeforeExecuteExecutor(inner)
     )
-    registry = build_default_registry(crasher) if repeatable else unsafe_registry(crasher)
+    # `classification` is the precise control; `repeatable` is the older
+    # two-way switch every Milestone 6 test uses, kept working so none of them
+    # had to change when the classification became three-valued.
+    if classification is not None:
+        registry = ToolRegistry(
+            (dataclasses.replace(build_file_search_spec(crasher), side_effect=classification),)
+        )
+    else:
+        registry = build_default_registry(crasher) if repeatable else unsafe_registry(crasher)
     adapter = ScriptedModelAdapter(
         tuple(responses) if responses else (ModelResponse(structured_output=VALID_PROPOSAL),)
     )

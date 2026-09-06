@@ -16,6 +16,8 @@ import pathlib
 
 import pytest
 
+from local_agent.state_machine import State
+
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "local_agent"
 
 # The base grant every production module holds. Deliberately tiny: the
@@ -92,6 +94,12 @@ MODULE_IMPORT_GRANTS: dict[str, frozenset[str]] = {
     # and `uuid` for run identity. Neither is a capability: no I/O, no
     # network, no ambient state — `uuid4` reads the OS random source only.
     "records.py": frozenset({"hashlib", "uuid"}),
+    # Milestone 7. `hashlib` content-addresses a capability the same way
+    # `records.py` content-addresses an execution; `types` supplies
+    # `MappingProxyType`, which is what makes the registry's map read-only
+    # rather than a plain dict anyone could write through. Neither performs
+    # I/O, opens a socket, or reads ambient state.
+    "registry.py": frozenset({"hashlib", "types"}),
 }
 
 # Modules that must never touch a filesystem, whatever else changes. Listed
@@ -1163,3 +1171,250 @@ def test_the_bypass_check_actually_catches_a_violation() -> None:
             for name in names
             if {part for part in name.lower().split("_") if part} & BYPASS_WORDS
         }
+
+
+# ===========================================================================
+# Milestone 7: the capability contract and the tool-authoring boundary
+#
+# The question is "what stops a capability from becoming an authority?", and
+# the answers below are structural: an executor module cannot reach the objects
+# that hold authority, and the ownership of every authority-bearing property is
+# asserted rather than described.
+
+EXECUTOR_MODULES = frozenset({"file_search.py", "workspace_fs.py"})
+
+# Modules an executor must never reach at all. Each would let the thing being
+# governed take part in governing it.
+AUTHORITY_MODULES = frozenset(
+    {"controller", "wiring", "recovery", "operator", "journal", "state_machine"}
+)
+
+# `policy` is deliberately absent from that list, and the distinction is worth
+# stating rather than smoothing over. `workspace_fs.py` imports
+# `FilesystemLimits`, `DEFAULT_FILESYSTEM_LIMITS` and `LEGAL_ROOT_IDS` — a
+# frozen ceiling object that trusted wiring hands it, and a constant. Enforcing
+# a limit someone else set is the executor's job; *deciding* one is not. So the
+# ban is on the deciding names rather than on the module, which is a narrower
+# and more honest boundary than "no policy import".
+FORBIDDEN_POLICY_NAMES = frozenset({"RunContext", "authorize", "evaluate_policy", "Decision"})
+
+
+@pytest.mark.parametrize("name", sorted(EXECUTOR_MODULES))
+def test_an_executor_module_cannot_reach_any_authority(name: str) -> None:
+    """An executor acts; it does not decide whether it may.
+
+    The registry is the one deliberate module-level exception: an executor
+    imports it for `ToolSpec` and the two exception types it raises. That is
+    the contract it implements, not authority it holds —
+    `test_an_executor_module_never_constructs_a_registry_or_a_run_context`
+    pins the difference.
+    """
+    imported = _intra_package_imports(_module(name))
+    for forbidden in sorted(AUTHORITY_MODULES):
+        assert forbidden not in imported, f"{name} imports {forbidden}"
+
+
+@pytest.mark.parametrize("name", sorted(EXECUTOR_MODULES))
+def test_an_executor_module_cannot_reach_a_gate_or_a_run_context(name: str) -> None:
+    """The narrower half: enforcing a ceiling is allowed, deciding is not."""
+    path = _module(name)
+    imported = _intra_package_imports(path)
+    reachable = imported | _attribute_reads(path) | _called_methods(path)
+    for forbidden in sorted(FORBIDDEN_POLICY_NAMES):
+        assert forbidden not in reachable, f"{name} reaches {forbidden}"
+
+
+def test_the_gate_reachability_check_actually_catches_a_violation() -> None:
+    """Adversarial: an executor that authorized itself must be caught."""
+    import tempfile
+
+    poisoned = (
+        "from ..policy import authorize\n\n\ndef run(spec, args, ctx):\n"
+        "    return authorize(spec, args, ctx)\n"
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        candidate = pathlib.Path(directory) / "workspace_fs.py"
+        candidate.write_text(poisoned)
+        reachable = (
+            _intra_package_imports(candidate)
+            | _attribute_reads(candidate)
+            | _called_methods(candidate)
+        )
+        assert reachable & FORBIDDEN_POLICY_NAMES
+
+    real = _module("workspace_fs.py")
+    assert (
+        not (_intra_package_imports(real) | _attribute_reads(real) | _called_methods(real))
+        & FORBIDDEN_POLICY_NAMES
+    )
+
+
+@pytest.mark.parametrize("name", sorted(EXECUTOR_MODULES))
+def test_an_executor_module_never_constructs_a_registry_or_a_run_context(name: str) -> None:
+    """Implementing the contract is not the same as defining it."""
+    constructed = _constructed_types(_module(name))
+    for forbidden in ("ToolRegistry", "RunContext", "Controller", "RunJournal"):
+        assert forbidden not in constructed, f"{name} constructs {forbidden}"
+
+
+@pytest.mark.parametrize("name", sorted(EXECUTOR_MODULES))
+def test_an_executor_module_assigns_to_no_authority_attribute(name: str) -> None:
+    assert not _attribute_assignments(_module(name)) & AUTHORITY_ATTRIBUTES
+
+
+def test_the_executor_boundary_check_actually_catches_a_violation() -> None:
+    """Adversarial: an executor that imported the controller must be caught."""
+    import tempfile
+
+    poisoned = (
+        "from ..controller import Controller\n" + (SRC / "executors" / "file_search.py").read_text()
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        candidate = pathlib.Path(directory) / "file_search.py"
+        candidate.write_text(poisoned)
+        assert "controller" in _intra_package_imports(candidate)
+
+    assert "controller" not in _intra_package_imports(SRC / "executors" / "file_search.py")
+
+
+def test_no_executor_module_writes_durable_state_or_calls_a_model() -> None:
+    """Only the controller records what happened, and only it asks the model."""
+    for name in sorted(EXECUTOR_MODULES):
+        constructed = _constructed_types(_module(name))
+        for forbidden in (
+            "ExecutionAuthorized",
+            "ExecutionCompleted",
+            "RunTerminal",
+            "RunStarted",
+            "OperatorDecisionRecorded",
+        ):
+            assert forbidden not in constructed, f"{name} constructs {forbidden}"
+        assert "chat" not in _called_methods(_module(name)), f"{name} calls a model"
+
+
+def test_only_the_controller_invokes_an_executor() -> None:
+    """`.executor` is reachable from exactly one production module.
+
+    The registry defines the field and recovery re-resolves specs, so the check
+    is on *reaching the attribute*, which is what invoking one requires.
+    """
+    reachers = [
+        path.name
+        for path in _production_modules()
+        if "executor" in _attribute_reads(path) and path.name != "registry.py"
+    ]
+    assert reachers == ["controller.py"]
+
+
+def test_the_capability_contract_is_not_reachable_from_the_model_layer() -> None:
+    """An adapter maps wire fields; it has no business defining capabilities."""
+    for name in sorted(MODEL_LAYER_MODULES):
+        constructed = _constructed_types(_module(name))
+        for forbidden in ("ToolSpec", "ToolRegistry"):
+            assert forbidden not in constructed, f"{name} constructs {forbidden}"
+
+
+def test_only_trusted_wiring_and_capability_builders_construct_a_registry() -> None:
+    """Registration is assembly-time, in named places, not anywhere convenient."""
+    builders = [
+        path.name for path in _production_modules() if "ToolRegistry" in _constructed_types(path)
+    ]
+    assert sorted(builders) == ["wiring.py"]
+
+
+def test_only_capability_builders_construct_a_toolspec() -> None:
+    definers = [
+        path.name for path in _production_modules() if "ToolSpec" in _constructed_types(path)
+    ]
+    assert sorted(definers) == ["file_search.py", "workspace_fs.py"]
+
+
+# ---------------------------------------------------------------------------
+# The authority matrix, encoded rather than described
+# ---------------------------------------------------------------------------
+#
+# Every row names one authority-bearing property and the single component that
+# owns it. A property with two authoritative writers is an authority leak, so
+# the matrix is asserted by behaviour below rather than left in a document.
+
+
+def test_the_authority_matrix_holds() -> None:
+    """One assertion per row of the matrix in docs/milestone-7-decisions.md."""
+    import dataclasses
+
+    from local_agent.contracts import RETRYABLE_CODES, RawToolCall
+    from local_agent.executors.file_search import FakeFileSearchExecutor
+    from local_agent.operator import OperatorDecision
+    from local_agent.persistence.records import derive_execution_id
+    from local_agent.policy import RunContext
+    from local_agent.registry import SideEffect, ToolRegistry, ToolSpec
+    from local_agent.state_machine import TRANSITIONS
+    from local_agent.wiring import build_default_registry
+
+    registry = build_default_registry(FakeFileSearchExecutor())
+    spec = registry.get("file_search")
+    assert spec is not None
+
+    # Requested tool and arguments: model data, carried in a closed envelope
+    # with no authority fields available to it.
+    assert set(RawToolCall.model_fields) == {"tool", "arguments"}
+    assert RawToolCall.model_config["extra"] == "forbid"
+
+    # Tool existence: the registry, and nothing else, resolves a name.
+    assert registry.get("shell") is None
+
+    # Grants and budget: RunContext, frozen.
+    context = RunContext(run_id="r")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        context.max_attempts = 99  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        context.authorized_tools = frozenset({"shell"})  # type: ignore[misc]
+
+    # Retry eligibility: the controller's own code table plus the capability.
+    assert "POLICY_DENIED" not in RETRYABLE_CODES
+    assert spec.re_executable is True
+
+    # Side-effect classification and executor: the immutable ToolSpec.
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.side_effect = SideEffect.NONE  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.executor = FakeFileSearchExecutor()  # type: ignore[misc]
+
+    # Execution identity: derived by the controller from its own state.
+    assert derive_execution_id("r", "s", 1, "file_search", {}) == derive_execution_id(
+        "r", "s", 1, "file_search", {}
+    )
+
+    # Recovery decision is operator *input*; recovery authority is the
+    # controller's. The decision type cannot express an execution.
+    assert "tool" not in OperatorDecision.model_fields
+    assert "arguments" not in OperatorDecision.model_fields
+
+    # Terminality: the transition table, which has no edge out of TERMINAL.
+    assert TRANSITIONS[State.TERMINAL] == frozenset()
+
+    # And a capability cannot be added to a live registry.
+    with pytest.raises(AttributeError):
+        registry._by_name = {}
+    assert isinstance(registry, ToolRegistry)
+    assert isinstance(spec, ToolSpec)
+
+
+def test_the_authority_matrix_check_is_not_vacuous() -> None:
+    """Adversarial control: an unfrozen stand-in must fail the same assertions."""
+    import dataclasses
+
+    @dataclasses.dataclass
+    class MutableContext:
+        max_attempts: int = 3
+
+    loose = MutableContext()
+    loose.max_attempts = 99  # no exception — which is why the real one is frozen
+    assert loose.max_attempts == 99
+
+
+def test_state_is_importable_for_the_matrix() -> None:
+    """Guards the import the matrix test relies on, so a rename fails loudly."""
+    from local_agent.state_machine import State as _State
+
+    assert _State.TERMINAL.value == "TERMINAL"

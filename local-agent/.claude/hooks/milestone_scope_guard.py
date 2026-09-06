@@ -129,6 +129,11 @@ MODULE_GRANTS = {
     "workspace_fs.py": {"pathlib"},
     "http.py": {"urllib"},
     "journal.py": {"os", "pathlib"},
+    # Milestone 7: `registry.py` content-addresses a capability. Neither
+    # `hashlib` nor `types` (for MappingProxyType) performs I/O, opens a
+    # socket, or reads ambient state, and neither is on the forbidden list —
+    # the entry is here so the two grant tables read the same.
+    "registry.py": set(),
 }
 
 

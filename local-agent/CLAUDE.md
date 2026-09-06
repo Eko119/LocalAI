@@ -9,8 +9,9 @@ package, summarised in [`docs/milestone-1-decisions.md`](docs/milestone-1-decisi
 [`docs/milestone-2-decisions.md`](docs/milestone-2-decisions.md),
 [`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md),
 [`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md),
-[`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md), and
-[`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md). Where this
+[`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md),
+[`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md), and
+[`docs/milestone-7-decisions.md`](docs/milestone-7-decisions.md). Where this
 file and that package disagree, the package wins, and the disagreement should be
 written down rather than resolved silently.
 
@@ -28,8 +29,8 @@ those, it is wrong regardless of how well it works.
 
 Milestones 1 (deterministic control plane), 2 (read-only filesystem),
 3 (production model adapter), 4 (live integration hardening), 5 (durable run
-state and crash recovery) and 6 (operator-controlled recovery) are complete and
-gated by CI.
+state and crash recovery), 6 (operator-controlled recovery) and 7 (the
+capability contract) are complete and gated by CI.
 
 **Milestone 4 is hardened but not yet observed live.** No LocalAI instance was
 reachable where it was written, so the four live scenarios are implemented and
@@ -41,7 +42,8 @@ real instance. See `docs/milestone-4-decisions.md` §1 and §8.
 policy, retry budget, parser boundary, audit events, the `workspace.read` /
 `workspace.list` capability, the LocalAI model adapter and its transport, the
 durable run journal with its recovery and replay, the operator control plane
-(inspection, decisions, approved resume, abort), and tests.
+(inspection, decisions, approved resume, abort), the capability admission
+contract, and tests.
 
 **Explicitly out of scope until a later milestone opens it:** writes to a
 workspace, shell or subprocess execution, Playwright or any browser, network
@@ -70,6 +72,32 @@ scratch — registry, argument schema, both gates, execution identity — *after
 the decision is durable and *before* any executor runs. Never add a `--force`,
 `--unsafe`, `--bypass` or equivalent; there is no generic admin execution path
 and adding one would undo this milestone entirely.
+
+**A capability is admitted, never merely constructed.** `ToolSpec` is a plain
+frozen dataclass and dataclasses do not validate, so construction proves
+nothing. `ToolRegistry` runs `admit` on every entry, every time — there is
+deliberately no "already checked" marker, because a marker is a field and
+`dataclasses.replace` copies fields. Admission checks the name, both schemas,
+the executor protocol, the timeout range, and the coherence rules; a
+`destructive` capability that does not require authorization would skip the
+grant check entirely, so it cannot exist.
+
+**Side-effect, retry and idempotency are three questions, not one.**
+`SideEffect` is `NONE` / `IDEMPOTENT` / `MUTATING`, defaulting to `MUTATING`.
+`side_effect_free` (did anything happen?) and `re_executable` (is repeating
+safe?) are *derived* properties, so they cannot drift. Never collapse them back
+into a boolean, and never equate `side_effect_free` with retryable — an
+idempotent capability is safe to retry while emphatically having had an effect.
+The controller's retry branch consults `re_executable`; before Milestone 7 it
+did not, and a failing `MUTATING` capability ran once per attempt.
+
+**A capability is content-addressed because immutability cannot reach its
+schemas.** `args_schema` and `result_schema` are classes and Python classes are
+mutable — measured, not assumed. `capability_digest` covers both schemas plus
+the declared properties and is recorded on `ExecutionAuthorized`, so a
+definition that changed after authorization is detected by recovery. It detects
+drift, not tampering; a record with no digest is reported `capability_verified
+= False` rather than treated as verified.
 
 **Recovery never calls the model.** Not to plan, not to validate, not to decide
 whether resuming is safe. A model that could influence recovery would be an
@@ -126,7 +154,8 @@ commands CI runs, in the same order.
     src/local_agent/
       contracts.py      typed boundary models (frozen, extra="forbid")
       state_machine.py  State enum + explicit transition table
-      registry.py       ToolSpec, ToolRegistry, ToolExecutor protocol
+      registry.py       the capability contract — ToolSpec, SideEffect, admit,
+                        capability_digest, the immutable ToolRegistry
       policy.py         RunContext (frozen authority) + the two gates
       controller.py     the orchestrator — the only component with authority
       model_adapter.py  ModelAdapter protocol + deterministic fake
@@ -147,7 +176,7 @@ commands CI runs, in the same order.
         http.py         sole holder of a network grant
     tests/              unit, adversarial, authority, filesystem, model,
                         transport, persistence, recovery, operator,
-                        determinism, architecture
+                        capability, determinism, architecture
       live_support.py   env conventions + gate semantics (test layer only)
       test_live_localai.py     opt-in live scenarios (marked `live`)
       test_live_boundary.py    deterministic proof of the gate semantics

@@ -205,6 +205,17 @@ class ExecutionAuthorized(_Record):
     # Copied from the controller-owned ToolSpec, never from model output. It
     # decides whether an ambiguous crash may be resolved by re-execution.
     side_effect_free: bool
+    # Milestone 7. The content address of the capability *as it was defined
+    # when this execution was authorized*. Optional because journals written
+    # before capability digests existed are still readable: absent means "not
+    # verifiable", which recovery reports rather than treating as verified.
+    #
+    # Like every other digest in this codebase it detects drift, not tampering
+    # — an attacker who can rewrite the record can recompute this too. What it
+    # catches is the case nothing else could: a capability whose *definition*
+    # changed underneath an authorized execution, where the arguments still
+    # validate and the execution identity still re-derives.
+    capability_digest: str | None = Field(default=None, min_length=32, max_length=32)
 
 
 class ExecutionCompleted(_Record):

@@ -56,7 +56,13 @@ from .persistence.records import (
 )
 from .policy import RunContext, authorize, evaluate_policy
 from .recovery import Disposition, RecoveryPlan, plan_recovery
-from .registry import ToolDenialError, ToolExecutionError, ToolRegistry, ToolSpec
+from .registry import (
+    ToolDenialError,
+    ToolExecutionError,
+    ToolRegistry,
+    ToolSpec,
+    capability_digest,
+)
 from .state_machine import Run, State
 
 # Model-facing wording. Deliberately terse and gate-agnostic: a denial must
@@ -276,6 +282,12 @@ class Controller:
         while True:
             tool_call_id = f"{step_id}-a{attempt}"
             tool_name = "unknown"
+            # The capability whose executor was actually invoked on this
+            # attempt, or None if the attempt was rejected before EXECUTE.
+            # Retry eligibility depends on it: repeating a capability that
+            # already ran is a different question from repeating a proposal
+            # that never did.
+            invoked: ToolSpec | None = None
 
             try:
                 if seed is not None:
@@ -367,8 +379,12 @@ class Controller:
                             arguments=args.model_dump(mode="json"),
                             execution_id=execution_id,
                             side_effect_free=spec.side_effect_free,
+                            capability_digest=capability_digest(spec),
                         )
                     )
+                # From here on a physical effect may have occurred, so this
+                # is set before the call rather than after it.
+                invoked = spec
                 try:
                     raw_result = self._execute(spec, args, tool_call_id, attempt, recorder)
                 except _Rejection as rejection:
@@ -409,11 +425,35 @@ class Controller:
 
                 self._enter(machine, recorder, State.FEEDBACK)
 
-                # BUDGET. Both halves of this condition are controller state:
-                # `retryable` comes from the controller's own code table and
-                # `attempt`/`max_attempts` from the frozen RunContext. No value
-                # the model produced participates in this decision.
-                if error.retryable and attempt < run_context.max_attempts:
+                # CAPABILITY GATE (Milestone 7). Retryability of an *error* and
+                # re-executability of a *capability* are different questions,
+                # and before this gate existed only the first was asked — so a
+                # failing `MUTATING` capability was re-run up to `max_attempts`
+                # times, compounding its effect once per attempt. Measured, not
+                # theorised: three physical side effects for a budget of three.
+                #
+                # `invoked is None` means the attempt was rejected before the
+                # executor was reached, so nothing happened and the ordinary
+                # retry rules apply unchanged.
+                capability_permits_retry = invoked is None or invoked.re_executable
+                if error.retryable and not capability_permits_retry:
+                    recorder.record(
+                        "retry_withheld",
+                        tool=tool_name,
+                        attempt=attempt,
+                        reason="capability_not_re_executable",
+                    )
+
+                # BUDGET. Every part of this condition is controller state:
+                # `retryable` comes from the controller's own code table,
+                # `attempt`/`max_attempts` from the frozen RunContext, and
+                # `re_executable` from the immutable ToolSpec. No value the
+                # model produced participates in this decision.
+                if (
+                    error.retryable
+                    and capability_permits_retry
+                    and attempt < run_context.max_attempts
+                ):
                     self._enter(machine, recorder, State.RETRY)
                     recorder.record("retry", attempt=attempt, next_attempt=attempt + 1)
                     feedback = ToolFeedback(tool=tool_name, accepted=False, error=error)
@@ -421,6 +461,12 @@ class Controller:
                     self._enter(machine, recorder, State.GENERATE)
                     continue
 
+                # A retry withheld by the capability gate still reports
+                # RETRY_EXHAUSTED to the model: from the model's side no
+                # further attempt is available, which is exactly what that code
+                # means, and telling it *why* would leak the capability's
+                # side-effect classification into a channel that must not carry
+                # it. The true reason is in the audit stream above.
                 terminal_code: ErrorCode = "RETRY_EXHAUSTED" if error.retryable else error.code
                 self._enter(machine, recorder, State.TERMINAL)
                 recorder.record("terminal", status="failed", code=terminal_code, attempts=attempt)

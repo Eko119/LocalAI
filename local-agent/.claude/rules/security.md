@@ -139,6 +139,49 @@ must remain unable to perform the operations they authorize.
   `^[A-Za-z0-9._-]{1,128}$` at the record boundary, which is what stops a run
   id from becoming a path traversal. Do not loosen that pattern.
 
+## The capability boundary
+
+- **Constructing a `ToolSpec` proves nothing; admission does.** A dataclass
+  does not validate, so `ToolRegistry` runs `admit` on every entry, every time.
+  Never add an "already checked" marker — `dataclasses.replace` copies fields,
+  so a mark would survive onto a spec whose properties had changed.
+- **A capability declares what it is, never what it is allowed.** The one
+  combination where that leaked — `destructive=True` with
+  `requires_authorization=False`, which makes `authorize` skip the grant check
+  entirely — is now inadmissible. The fix is at admission; `authorize` is a
+  Milestone 1 invariant and stays untouched.
+- **Names are audit keys and journal values.** Bounded at 64 characters,
+  dotted lower-snake only. A path-shaped or whitespace-bearing name is refused.
+- **Three-valued side effects.** `NONE` / `IDEMPOTENT` / `MUTATING`, default
+  `MUTATING`. `side_effect_free` answers "did anything happen"; `re_executable`
+  answers "is repeating safe". Both are derived, so they cannot drift, and they
+  are not the same question — never collapse them, and never equate either with
+  an error code's retryability.
+- **Retry is gated by the capability, not only by the error.** The branch is
+  `error.retryable AND (nothing ran OR re_executable) AND budget`. A rejection
+  before EXECUTE leaves the ordinary repair loop untouched.
+- **What the model is told does not include the classification.** A withheld
+  retry still reports `RETRY_EXHAUSTED`; the true reason is a `retry_withheld`
+  audit event. Never widen the model-facing code to explain a capability.
+- **The registry is immutable in every direction available to ordinary code.**
+  `MappingProxyType` for the map, `__setattr__` and `__delattr__` refusing,
+  read-only views, duplicates refused rather than replaced. The honest limit:
+  `object.__setattr__` defeats this, as it defeats any in-process guard — say
+  that rather than claiming immunity.
+- **Schemas are classes, and classes are mutable.** So a capability is
+  content-addressed: `capability_digest` covers both JSON schemas and the
+  declared properties, and recovery fails closed on a mismatch. It detects
+  drift, not tampering — there is no key. A record with no digest is
+  `capability_verified = False`, never "assumed fine".
+- **An executor acts and never decides.** It reaches no `RunContext`, no gate,
+  no registry, no journal, no model — asserted against module ASTs *and*
+  behaviourally from inside a real `execute`. It may deny via
+  `ToolDenialError`; it can never grant.
+- **Enforcing a ceiling is not deciding one.** `workspace_fs.py` may import
+  `FilesystemLimits`; it may not reach `RunContext`, `authorize`,
+  `evaluate_policy` or `Decision`. Keep the ban on the deciding names rather
+  than widening it to the module.
+
 ## The operator boundary
 
 - **An operator is a trusted actor and an untrusted source of values.** Both

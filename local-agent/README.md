@@ -178,6 +178,12 @@ module's own AST.
 | A record claiming an unknown type or schema version | Refused before Pydantic sees it; unknown is never "probably fine" |
 | A truncated final line after a crash | Never `fsync`-returned, so never durable; dropped, not guessed at |
 | Replaying a hostile journal to force a side effect | `replay` takes no executor and cannot reach one |
+| A capability declaring itself exempt from authorization | Inadmissible: `destructive` without `requires_authorization` is refused |
+| A capability inserted into a live registry | The map is a read-only proxy and the object refuses rebinding |
+| A capability schema widened after authorization | The content-addressed digest no longer matches; recovery fails closed |
+| A `MUTATING` capability re-run once per retry | Retry consults `re_executable`, not just the error code |
+| An executor reading or changing the run's authority | Its whole world is one frozen arguments object |
+| A result carrying `authorized`, `max_attempts` or a `policy` object | Fails verification; results are data, never commands |
 | An operator approval replayed against a later plan | Recording any decision changes the plan's content-addressed id |
 | An operator naming a different tool or arguments | The decision type has no field for either, and forbids extras |
 | An operator resuming an ambiguous, non-repeatable execution | Never offered; `available_actions` has no code path for it |
@@ -354,6 +360,73 @@ lock file precisely because the kernel releases it when the process dies —
 a crashed run is immediately recoverable rather than blocked forever by a
 stale lock.
 
+## The capability contract
+
+Every capability is admitted before it exists, and nothing about it can be
+changed afterwards by anything the model, an executor or a result can say.
+
+**Admission, not construction.** `ToolSpec` is a frozen dataclass and
+dataclasses do not validate, so `ToolRegistry` puts every entry through `admit`
+— every time, with no "already checked" marker to forge. It refuses an empty or
+path-shaped or uppercase name, a timeout outside `0.001 .. 300`, an
+`args_schema` that is not a `BaseModel`, an executor with no `execute`, and two
+combinations that are individually well-typed and jointly meaningless:
+
+```python
+# refused: `authorize` skips the grant check for a capability that
+# does not require authorization, so this one would run ungranted
+ToolSpec(name="wipe", destructive=True, requires_authorization=False, ...)
+
+# refused: destroying something while claiming repetition is free
+ToolSpec(name="wipe", destructive=True, side_effect=SideEffect.NONE, ...)
+```
+
+**Three side-effect values, two derived questions.** A boolean was answering
+two different questions at once:
+
+| `side_effect` | `side_effect_free` | `re_executable` | Meaning |
+|---|---|---|---|
+| `NONE` | True | True | Nothing observable happened. Reading a file. |
+| `IDEMPOTENT` | False | True | Something happened; N runs equal one run. |
+| `MUTATING` (default) | False | False | The effect compounds. |
+
+Both properties are derived, so they cannot drift, and both refuse assignment.
+**Retry is not `side_effect_free`.** The controller's branch is
+`error.retryable AND (nothing ran OR re_executable) AND budget remains` — before
+this, a failing `MUTATING` capability was re-run once per attempt, producing
+three irreversible acts for a budget of three.
+
+**A capability is content-addressed, because immutability cannot reach its
+schemas.** `args_schema` and `result_schema` are classes, and Python classes are
+mutable — `model_config`, `model_fields` and even the compiled validator can be
+replaced. Rather than pretend otherwise, the capability gets a digest over both
+JSON schemas plus its declared properties, recorded on `ExecutionAuthorized`:
+
+```python
+plan = plan_recovery(journal.records(), registry, run_context)
+plan.capability_verified  # False means "no digest recorded", never "assumed fine"
+plan.capability_digest  # the definition this execution was authorized under
+```
+
+A definition that changed after authorization is then a fatal
+`journal_capability_digest_mismatch` — the one case where the arguments still
+validate, the execution identity still re-derives, and every other check passes.
+Like the journal checksum, it detects drift and not tampering; the executor is
+deliberately outside it, so swapping a spy for the production executor keeps the
+capability identical.
+
+**The registry is immutable in every direction ordinary code has.** A
+`MappingProxyType` map, `__setattr__` and `__delattr__` that refuse, read-only
+views, duplicates refused rather than replaced, and no `register`/`replace`/
+`remove` to call. The honest limit: `object.__setattr__` defeats this, as it
+defeats any in-process guard — which is exactly why the digest exists.
+
+**An executor acts and never decides.** From inside `execute` it can reach no
+run context, no grants, no registry, no controller, and cannot mutate its own
+arguments; structurally it imports no authority module, constructs no registry
+or durable record, and calls no model. `.executor` is reachable from exactly one
+production module. It may *deny* via `ToolDenialError` and can never grant.
+
 ## Operator-controlled recovery
 
 Milestone 5 stopped at a plan. This layer lets a human act on one without
@@ -473,6 +546,7 @@ and saying so is more honest than a field that looks like attribution.
       model_service.py  the production LocalAI adapter
       recovery.py       crash-recovery planning + observational replay (pure)
       operator.py       operator control plane — decisions, binding, inspection
+      registry.py       the capability contract — admission, identity, immutability
       executors/
         file_search.py  the Milestone 1 deterministic fake
         workspace_fs.py the only module permitted to touch a filesystem
@@ -510,4 +584,5 @@ merely stated.
 - [`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md) — live-integration gate semantics, credential handling, and what remains unobserved
 - [`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md) — durable state architecture, crash windows, execution semantics, and the proven/assumed/not-guaranteed split
 - [`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md) — operator authority, approval binding, revalidation, abort semantics, and why there is no operator identity
+- [`docs/milestone-7-decisions.md`](docs/milestone-7-decisions.md) — the capability contract, the authority matrix, admission, side-effect and retry semantics, and the requirements a future side-effecting capability must satisfy
 - [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/) — working rules for this subproject
