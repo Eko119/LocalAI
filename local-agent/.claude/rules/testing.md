@@ -45,6 +45,7 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
 | `test_operator.py` | the control plane: plan identity, approval binding, staleness, the adversarial operator matrix, terminality, inspection, ceilings |
 | `test_operator_recovery.py` | recovery end to end: 13 crash windows, safe resume, revalidation, abort semantics, concurrency, model-context security, transparency |
 | `test_capability.py` | the capability contract: the admission matrix, immutability including nested, capability identity, the side-effect/retry/idempotency matrix (cases A–H), executor isolation, the result boundary, authority-named model fields, and the runtime secret sentinels |
+| `test_workspace_write.py` | the constrained artifact writer: containment under a write, the file-type policy, size limits and their journal coupling, authorization, bounded idempotency, retry counts, crash windows, operator recovery, and the result and model boundaries |
 | `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem, model, recovery, and operator scenario |
 | `test_controller_flow.py` | gate ordering, audit events, budget arithmetic |
 | `test_architecture.py` | the capability boundary, enforced against the package AST |
@@ -119,8 +120,12 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
    — the admission gate, the registry proxy, the attribute guard, the retry
    gate, both derived properties, the digest check, the coherence rule, name
    validation, the executor-protocol check, and a deliberate metadata leak into
-   the model surface. A test nobody has watched fail is a test nobody has
-   verified.
+   the model surface. Milestone 8 added fifteen more against a real side
+   effect — path containment in both its mechanisms, the file-type checks, the
+   write ceiling and its journal coupling, the classification, retry
+   suppression, digest verification, result validation, registry admission,
+   recovery's resume gate, and both read-only builders. A test nobody has
+   watched fail is a test nobody has verified.
 18. **Watch for a mutation "caught" by a broken selector.** A `-k` expression
    that matches nothing exits non-zero and looks like a detection. Treat "no
    tests ran" as an audit failure, not a pass — this happened once and was
@@ -131,6 +136,35 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
 20. **Assert the limitation too.** `test_the_schema_classes_a_spec_points_at_remain_mutable`
    exists to keep a real weakness visible. Deleting a test because it documents
    something uncomfortable is how a known limitation becomes a forgotten one.
-21. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
+21. **A side-effecting capability needs a third counter.** `call_count` says
+   the executor was dispatched; `write_count` says bytes reached a disk. They
+   are different facts and only the second is irreversible, so every refusal
+   in `test_workspace_write.py` asserts the run was refused, `write_count` is
+   zero, *and* — where an escape was attempted — that the sentinel file
+   outside the root is byte-identical. Without the third, a containment bug
+   would produce a passing test rather than a failing one.
+22. **A hang is not a failure, so test the ordering.** An outcome assertion
+   cannot catch a removed check whose absence causes a block: the test never
+   finishes. Where a check exists to prevent blocking — the
+   non-regular-destination check, because `os.open` on a FIFO waits for a
+   reader and no timeout is enforced anywhere — assert that the dangerous call
+   is never reached, using a spy with its own positive control. That turns a
+   five-minute stall into a named failure in milliseconds.
+23. **Derive payloads from a ceiling and you stop testing the ceiling.** Every
+   size test here computes its payload from `max_file_write_bytes`, so raising
+   that constant moves the goalposts and they all still pass. A constant whose
+   *value* matters needs a test that names the invariant —
+   `test_the_write_ceiling_stays_below_the_journal_argument_ceiling` — not
+   just one that exercises the mechanism.
+24. **Audit the audit.** A mutation harness is production code for the purpose
+   of trusting its output. Pass `-k` expressions as argument lists, never a
+   string that gets `.split()` (spaces become path arguments, and pytest then
+   selects nothing or the wrong subset — this produced both a false catch in
+   M7 and two false misses in M8). Treat a subprocess timeout as an audit
+   failure. And re-examine every "a second mechanism holds" claim: it is a
+   statement about a *specific* failure mode, and asking a containment
+   mechanism to cover an availability failure is a category error that only
+   measurement catches.
+25. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
    `mypy`) pass before a change is done. CI runs the same ones in the same
    order.

@@ -67,11 +67,14 @@ Disposition = Literal[
     "no_execution_authorized",
     # Authorized and completed: the ambiguity window is closed.
     "execution_completed",
-    # Authorized, no completion, and the tool is side-effect free: repeating it
-    # adds nothing, so recovery may safely re-execute.
+    # Authorized, no completion, and the capability produces no observable
+    # effect at all: there is nothing for the ambiguity to be *about*.
     "execution_pending_repeatable",
-    # Authorized, no completion, and the tool is NOT side-effect free: whether
-    # the effect happened is unknowable from here. Fail closed and stop.
+    # Authorized, no completion, and the capability *does* have an observable
+    # effect: whether it happened is unknowable from here. This is a statement
+    # about evidence, not about safety — whether the execution may be repeated
+    # is answered separately by `ToolSpec.re_executable`, because an idempotent
+    # capability is safe to repeat while its outcome is genuinely unknown.
     "execution_unknown",
 ]
 
@@ -140,6 +143,11 @@ class RecoveryPlan:
     # "unverifiable", which an operator deciding on a resume needs to know.
     capability_digest: str | None = None
     capability_verified: bool = False
+    # From the *live* `ToolSpec`, not from the record: whether the controller
+    # may run this capability again. Distinct from `side_effect_free`, which
+    # says whether anything observable happened at all. An operator deciding on
+    # a resume needs both, and conflating them is what Milestone 8 repaired.
+    re_executable: bool = False
     # -- terminal facts, if the run already ended ---------------------------
     terminal_status: str | None = None
     terminal_code: str | None = None
@@ -308,22 +316,46 @@ def _validate_decisions(
     return decisions
 
 
+# The dispositions in which an execution is outstanding — authorized, with no
+# completion recorded. Whether one may be resumed is a *separate* question,
+# answered by the capability rather than by the disposition; see below.
+_PENDING_DISPOSITIONS = ("execution_pending_repeatable", "execution_unknown")
+
+
 def _available_actions(
-    disposition: Disposition, *, authorization_valid: bool, decisions: int
+    disposition: Disposition,
+    *,
+    authorization_valid: bool,
+    decisions: int,
+    re_executable: bool = False,
 ) -> tuple[OperatorAction, ...]:
     """The closed set of actions valid for this controller-derived state.
 
-    Three deliberate restrictions live here, and each is a fail-closed choice:
+    The interesting parameter is `re_executable`, and Milestone 8 is why it
+    exists. Milestone 6 keyed `resume` on the disposition alone, which was
+    correct while every capability was `SideEffect.NONE`: back then "nothing
+    observable happened" and "repeating is safe" were the same fact. Milestone 7
+    split them into two derived properties and fixed the *in-run retry* gate to
+    consult `re_executable` — but left this path consulting the disposition,
+    which is derived from `side_effect_free`. The two disagreed: an
+    `IDEMPOTENT` capability was retried inside a run and refused a resume after
+    a crash, for the same underlying operation.
 
-    * a **terminal** run offers nothing at all, so there is no action an
-      operator could take that would resurrect it;
-    * **`execution_unknown` does not offer `resume`.** The tool is not
-      side-effect free and the journal cannot say whether the effect happened,
-      so re-running it might duplicate a real side effect. The operator is not
-      permitted to overrule that, because doing so would be exactly the
-      "operator changes `side_effect_free`" move the threat model forbids. The
-      cost is real: an operator who *knows* the effect did not happen still
-      cannot resume, and must start a new run instead;
+    The invariant Milestone 6 was actually protecting is *never re-run
+    something whose repetition might duplicate an effect*, and `re_executable`
+    states exactly that. Keying on it preserves the invariant and repairs the
+    premise. A `MUTATING` execution is still never resumable, which is the case
+    the rule was written for.
+
+    The disposition stays honest and unchanged: an ambiguous crash on an
+    `IDEMPOTENT` capability is still `execution_unknown`, because the evidence
+    genuinely is unknown. Evidence and safety are different questions, and an
+    operator is shown both — `side_effect_free` says whether anything could
+    have happened, `re_executable` says whether repeating is safe.
+
+    The other restrictions are unchanged and fail closed:
+
+    * a **terminal** run offers nothing at all, so no action can resurrect it;
     * **`execution_completed` does not offer `resume`.** The physical call
       finished, but the journal deliberately never stored the result, so the
       run cannot be verified without executing a second time.
@@ -334,7 +366,7 @@ def _available_actions(
         # The control plane is bounded like everything else that persists.
         return ()
     actions: tuple[OperatorAction, ...] = ()
-    if disposition == "execution_pending_repeatable" and authorization_valid:
+    if disposition in _PENDING_DISPOSITIONS and authorization_valid and re_executable:
         actions += ("resume",)
     return actions + _TERMINATING_ACTIONS + _PASSIVE_ACTIONS
 
@@ -448,9 +480,13 @@ def plan_recovery(
             disposition=disposition,
             reason_code=DISPOSITION_REASONS[disposition],
             available_actions=_available_actions(
-                disposition, authorization_valid=valid, decisions=recorded
+                disposition,
+                authorization_valid=valid,
+                decisions=recorded,
+                re_executable=spec.re_executable,
             ),
             authorization_valid=valid,
+            re_executable=spec.re_executable,
             attempt=authorization.attempt,
             step_id=authorization.step_id,
             tool=authorization.tool,

@@ -40,6 +40,9 @@ EventType = Literal[
     # Milestone 7: a retry the budget allowed but the capability contract did
     # not, because re-running it would compound a side effect.
     "retry_withheld",
+    # Milestone 8: the write-ahead record could not be persisted, so the
+    # attempt was refused before the executor rather than crashing the run.
+    "authorization_not_persistable",
     # Milestone 6: the operator control plane. Structural facts only, as
     # everywhere else — an action name, a plan id, a sequence, a stable reason
     # code. Never an operator identity, never free text.

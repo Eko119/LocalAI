@@ -88,8 +88,15 @@ ends at a normalized, bounded, audited rejection with the executor untouched.
 
 ## The filesystem capability
 
-Two tools, both read-only: `workspace.read` and `workspace.list`. The model
-sees an abstract namespace of exactly two roots and supplies a relative path:
+Three tools. Two are read-only — `workspace.read` and `workspace.list` — and
+are what a deployment gets by default. The third, `workspace.write`, is the
+first capability in this project that changes anything, and it is described
+separately below because acquiring it is a deliberate act: it lives in its own
+module, its own registry builder and its own run-context builder, so an
+existing read-only deployment cannot gain it by upgrading.
+
+The model sees an abstract namespace of exactly two roots and supplies a
+relative path:
 
 ```json
 {"tool": "workspace.read",
@@ -427,6 +434,59 @@ arguments; structurally it imports no authority module, constructs no registry
 or durable record, and calls no model. `.executor` is reachable from exactly one
 production module. It may *deny* via `ToolDenialError` and can never grant.
 
+## The constrained artifact writer
+
+`workspace.write` is the first capability here that does something
+irreversible. It exists to test the machinery above against a real effect, not
+to become a filesystem API: it replaces the entire content of exactly one
+regular file beneath one authorized root, and that is the whole of it.
+
+```python
+from local_agent.wiring import (
+    build_writable_filesystem_registry,
+    build_writable_run_context,
+)
+
+registry = build_writable_filesystem_registry(roots)
+context = build_writable_run_context("run-1")
+```
+
+Separate builders, not a `writable=True` flag. A flag is one edit away from
+being passed by a caller who did not think about it; a differently-named
+function has to be typed on purpose.
+
+**Containment is reused, and the reuse has a twist.** There is one containment
+implementation in this package, so a traversal bug would have one place to
+live. But `_resolve_within_root` resolves with `strict=True` and cannot resolve
+a file that does not exist yet, so the writer resolves the destination's
+*parent* through it and handles the one remaining component itself. That falls
+out well: a missing parent is a refusal, which is how "never creates
+directories" is enforced — there is no `mkdir` here to forget to guard.
+
+**The leaf is opened with `O_NOFOLLOW`, and that is the security property.** A
+pre-flight "is it a symlink?" test is racy by construction; the flag moves the
+check into the same syscall as the open, so the kernel refuses instead of this
+code hoping. A test patches `is_symlink` to lie exactly once — precisely what
+winning that race achieves — and the bytes still do not land outside the root.
+
+Note what the flag does *not* cover. It guards the final component only, so a
+symlinked parent directory is followed happily; that is measured, and it is
+what makes the strict parent resolution load-bearing rather than tidy.
+
+**Classified `IDEMPOTENT`, under a bound that is stated rather than implied.**
+Running the identical request N times leaves the same file with the same bytes
+as running it once. Filesystem *metadata* is outside that bound — `mtime`
+advances every time and a test asserts that it does, so the limitation stays
+visible. The classification is what lets the controller retry a failed write:
+`re_executable` is True while `side_effect_free` is False, which is exactly the
+distinction Milestone 7 refused to collapse into a boolean.
+
+**What it does not claim.** Not atomic — `O_TRUNC` empties the file at open, so
+a crash mid-write leaves a file shorter than either version. Not transactional,
+not exactly-once. What it does claim is bounded and tested: the bytes are
+`fsync`ed before the call returns, and nothing is ever written outside the
+authorized root.
+
 ## Operator-controlled recovery
 
 Milestone 5 stopped at a plan. This layer lets a human act on one without
@@ -549,7 +609,8 @@ and saying so is more honest than a field that looks like attribution.
       registry.py       the capability contract — admission, identity, immutability
       executors/
         file_search.py  the Milestone 1 deterministic fake
-        workspace_fs.py the only module permitted to touch a filesystem
+        workspace_fs.py the only module permitted to *read* a workspace
+        workspace_write.py the only module permitted to *write* one
       persistence/
         records.py      versioned durable record contracts (pure, no I/O)
         journal.py      the only module permitted to write durable state
@@ -564,17 +625,20 @@ boundary, authorization, policy, retry budget, parser boundary, audit events, a
 read-only filesystem capability, a production model adapter over LocalAI's
 OpenAI-compatible endpoint, a durable run journal with crash recovery and
 observational replay, an operator control plane with bound approvals and
-auditable resume, and the test suite.
+auditable resume, one constrained artifact writer, and the test suite.
 
-**Deliberately absent:** writes to a workspace, shell or subprocess execution,
+**Deliberately absent:** every filesystem mutation other than replacing one
+regular file — no delete, rename, mkdir, chmod, copy or append — shell or
+subprocess execution,
 Playwright or any browser, network access outside the model transport, MCP,
 Docker code execution, Qdrant, SQLite, Gemma, llama.cpp, OS-level sandboxing,
 distributed coordination, a CLI binary, authenticated operator identity, and
 automatic *unattended* resumption — recovery produces a plan, and acting on it
 always requires an explicit, bound operator decision.
 `tests/test_architecture.py` enforces this against the package's own AST, with
-the filesystem grant scoped to one named module — the absence is checked, not
-merely stated.
+each filesystem grant scoped to one named module — the absence is checked, not
+merely stated. Reading and writing are separate grants held by separate
+modules, so the reader cannot mutate and the writer cannot browse.
 
 ## Further reading
 
@@ -585,4 +649,5 @@ merely stated.
 - [`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md) — durable state architecture, crash windows, execution semantics, and the proven/assumed/not-guaranteed split
 - [`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md) — operator authority, approval binding, revalidation, abort semantics, and why there is no operator identity
 - [`docs/milestone-7-decisions.md`](docs/milestone-7-decisions.md) — the capability contract, the authority matrix, admission, side-effect and retry semantics, and the requirements a future side-effecting capability must satisfy
+- [`docs/milestone-8-decisions.md`](docs/milestone-8-decisions.md) — the constrained artifact writer: path containment under a write, the file-type policy and the liveness finding behind it, size-limit ownership, the bounded idempotency claim, and what is deliberately not guaranteed
 - [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/) — working rules for this subproject

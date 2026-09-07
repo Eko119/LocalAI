@@ -12,6 +12,7 @@ This is the layer that makes "no shell executor exists" a checked fact.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import pathlib
 
 import pytest
@@ -100,6 +101,22 @@ MODULE_IMPORT_GRANTS: dict[str, frozenset[str]] = {
     # rather than a plain dict anyone could write through. Neither performs
     # I/O, opens a socket, or reads ambient state.
     "registry.py": frozenset({"hashlib", "types"}),
+    # Milestone 8 opened the first *write* to a workspace, to exactly one
+    # module, and granted it exactly one import. `os` is for `os.open`, which
+    # is not a convenience: `O_NOFOLLOW` is what makes the symlink check
+    # unraceable and `pathlib` has no way to express it.
+    #
+    # There is deliberately no `pathlib` grant. The writer never constructs a
+    # path — it receives already-resolved ones from `workspace_fs`'s containment
+    # helper and only joins a schema-validated leaf onto them — so it holds
+    # strictly *less* filesystem surface than the reader whose containment it
+    # borrows. An earlier draft of this entry granted `pathlib` and described
+    # code that was not there; the grant is the maximum a module may hold, so a
+    # grant wider than the module's actual needs is a latent widening.
+    #
+    # `workspace_fs.py` correspondingly does not gain `os`, so it stays
+    # provably read-only.
+    "workspace_write.py": frozenset({"os"}),
 }
 
 # Modules that must never touch a filesystem, whatever else changes. Listed
@@ -122,11 +139,18 @@ FILESYSTEM_MODULES = frozenset(
     {"pathlib", "os", "shutil", "glob", "tempfile", "io", "fileinput", "fcntl"}
 )
 
-# The two modules allowed to touch a filesystem, and why each one is.
-# They are different capabilities that happen to share a syscall surface:
-# one resolves a *model-requested* path under an authorized root, the
-# other writes *controller-owned* state to an operator-configured file.
-FILESYSTEM_GRANT_HOLDERS = frozenset({"workspace_fs.py", "journal.py"})
+# The modules allowed to touch a filesystem, and why each one is. They are
+# different capabilities that happen to share a syscall surface:
+#
+#   workspace_fs.py     resolves a *model-requested* path under an authorized
+#                       root and reads it. Provably read-only.
+#   journal.py          writes *controller-owned* durable state to an
+#                       operator-configured file.
+#   workspace_write.py  (Milestone 8) writes *model-requested* content to one
+#                       model-requested path under an authorized root. It is
+#                       separate from `workspace_fs.py` precisely so that
+#                       module's read-only proofs keep holding.
+FILESYSTEM_GRANT_HOLDERS = frozenset({"workspace_fs.py", "journal.py", "workspace_write.py"})
 
 # Anything that can open a socket, directly or indirectly.
 NETWORK_MODULES = frozenset(
@@ -807,14 +831,19 @@ def test_the_persistence_boundary_check_actually_catches_a_violation() -> None:
     assert "journal" not in _intra_package_imports(SRC / "model_service.py")
 
 
-def test_only_the_journal_writes_durable_state() -> None:
-    """Exactly one module opens a file for writing or forces it to disk.
+# The two modules that may put bytes on a disk, and the reason they are listed
+# apart rather than together. `journal.py` writes *controller-owned durable
+# state* — the evidence recovery reasons over. `workspace_write.py` writes a
+# *workspace artifact* — the capability's declared side effect. Conflating them
+# would be the mistake this separation exists to prevent: an executor that
+# could write durable state would be manufacturing the record of its own
+# execution, which `test_no_executor_module_writes_durable_state_or_calls_a_model`
+# independently forbids.
+BYTE_WRITING_MODULES = ("journal.py", "workspace_write.py")
 
-    Read-only opens are not writes: `workspace_fs.py` legitimately opens files
-    in mode "rb", which `test_the_filesystem_executor_only_opens_for_reading`
-    pins separately. What this asserts is narrower and is the property that
-    matters for durable state — only the journal can create or extend it.
-    """
+
+def _modules_that_write_bytes() -> list[str]:
+    """Modules that open a file for writing or force one to disk."""
     writers: list[str] = []
     for path in _production_modules():
         tree = ast.parse(path.read_text())
@@ -832,7 +861,43 @@ def test_only_the_journal_writes_durable_state() -> None:
                     writes = True
         if writes:
             writers.append(path.name)
-    assert writers == ["journal.py"]
+    return writers
+
+
+def test_only_two_named_modules_write_bytes_at_all() -> None:
+    """The set is closed, and each member is listed for a stated reason.
+
+    Read-only opens are not writes: `workspace_fs.py` legitimately opens files
+    in mode "rb", which `test_the_filesystem_executor_only_opens_for_reading`
+    pins separately, and it must stay off this list.
+    """
+    assert sorted(_modules_that_write_bytes()) == sorted(BYTE_WRITING_MODULES)
+    assert "workspace_fs.py" not in _modules_that_write_bytes()
+
+
+def test_only_the_journal_writes_durable_state() -> None:
+    """The narrower and more important half of the claim.
+
+    Writing bytes and writing *durable controller state* are different acts.
+    Only `journal.py` constructs a durable record, so only it can create the
+    evidence recovery reasons over — the artifact writer puts bytes in a
+    workspace and has no way to say anything about them.
+    """
+    recorders = [
+        path.name
+        for path in _production_modules()
+        if _constructed_types(path)
+        & {
+            "RunStarted",
+            "ExecutionAuthorized",
+            "ExecutionCompleted",
+            "RunTerminal",
+            "OperatorDecisionRecorded",
+            "EnvelopedRecord",
+        }
+    ]
+    assert "workspace_write.py" not in recorders
+    assert recorders == ["controller.py"]
 
 
 # ===========================================================================
@@ -1063,8 +1128,17 @@ def test_a_terminal_run_offers_no_action_in_any_disposition() -> None:
     assert _available_actions("terminal", authorization_valid=True, decisions=0) == ()
 
 
-def test_only_a_repeatable_pending_execution_is_ever_offered_a_resume() -> None:
-    """Exhaustive over the disposition space, because the space is small."""
+def test_only_a_pending_re_executable_authorized_execution_is_offered_a_resume() -> None:
+    """Exhaustive over the whole decision space, because the space is small.
+
+    Milestone 8 widened this from two axes to three. `resume` used to be keyed
+    on the disposition alone, which conflated "nothing observable happened"
+    with "repeating is safe" — true only while every capability was
+    `SideEffect.NONE`. It is now the conjunction of three independent facts:
+    the execution is outstanding, the gates still pass, and the capability
+    itself is re-executable. A `MUTATING` execution is still never resumable,
+    which is the case the original rule was written to protect.
+    """
     from local_agent.recovery import Disposition, _available_actions
 
     dispositions: tuple[Disposition, ...] = (
@@ -1075,13 +1149,20 @@ def test_only_a_repeatable_pending_execution_is_ever_offered_a_resume() -> None:
         "execution_unknown",
     )
     offered = {
-        (disposition, valid): "resume"
-        in _available_actions(disposition, authorization_valid=valid, decisions=0)
+        (disposition, valid, repeatable): "resume"
+        in _available_actions(
+            disposition,
+            authorization_valid=valid,
+            decisions=0,
+            re_executable=repeatable,
+        )
         for disposition in dispositions
         for valid in (True, False)
+        for repeatable in (True, False)
     }
     assert {key for key, value in offered.items() if value} == {
-        ("execution_pending_repeatable", True)
+        ("execution_pending_repeatable", True, True),
+        ("execution_unknown", True, True),
     }
 
 
@@ -1181,7 +1262,7 @@ def test_the_bypass_check_actually_catches_a_violation() -> None:
 # that hold authority, and the ownership of every authority-bearing property is
 # asserted rather than described.
 
-EXECUTOR_MODULES = frozenset({"file_search.py", "workspace_fs.py"})
+EXECUTOR_MODULES = frozenset({"file_search.py", "workspace_fs.py", "workspace_write.py"})
 
 # Modules an executor must never reach at all. Each would let the thing being
 # governed take part in governing it.
@@ -1326,7 +1407,7 @@ def test_only_capability_builders_construct_a_toolspec() -> None:
     definers = [
         path.name for path in _production_modules() if "ToolSpec" in _constructed_types(path)
     ]
-    assert sorted(definers) == ["file_search.py", "workspace_fs.py"]
+    assert sorted(definers) == ["file_search.py", "workspace_fs.py", "workspace_write.py"]
 
 
 # ---------------------------------------------------------------------------
@@ -1418,3 +1499,216 @@ def test_state_is_importable_for_the_matrix() -> None:
     from local_agent.state_machine import State as _State
 
     assert _State.TERMINAL.value == "TERMINAL"
+
+
+# ===========================================================================
+# Milestone 8: the constrained artifact writer
+#
+# The first capability with a real, irreversible side effect. Its boundary is
+# asserted the same way every other one is — against the module's own AST, with
+# a poisoned control proving each check can fail.
+
+WRITER = "workspace_write.py"
+
+
+def test_the_writer_holds_exactly_the_primitives_it_needs() -> None:
+    """`os` and `pathlib`, and nothing further.
+
+    `os` is not a convenience here. `O_NOFOLLOW` is what makes the symlink
+    check unraceable, and `pathlib` has no way to express it — so the low-level
+    call is the security mechanism rather than a style choice.
+    """
+    roots = _imported_roots(ast.parse(_module(WRITER).read_text()))
+    # Only `os`. `pathlib` is not imported at all: the writer receives resolved
+    # `Path` objects from the shared containment helper and never constructs
+    # one, so it holds strictly less filesystem surface than the reader does.
+    assert roots & FILESYSTEM_MODULES == {"os"}
+    assert not roots & NETWORK_MODULES
+
+
+def test_the_writer_reuses_the_one_containment_implementation() -> None:
+    """There is exactly one place a traversal bug could live, and it is shared.
+
+    A second `resolve`/`is_relative_to` pair inside the writer would be a
+    second containment implementation to keep correct. The writer imports the
+    reader's helper instead, and this asserts it did not quietly grow its own.
+    """
+    imported = _intra_package_imports(_module(WRITER))
+    assert "_resolve_within_root" in imported
+    assert "PhysicalRoots" in imported
+
+
+def test_the_writer_creates_no_directories_and_removes_nothing() -> None:
+    """The absent operations are the contract.
+
+    None of these appears anywhere in the module, so "never creates
+    directories", "never deletes", "never renames" and "never changes
+    permissions" are facts about the code rather than promises about it.
+    """
+    # Checked against *called names*, not against text. `is_symlink` contains
+    # "symlink" and is a perfectly legitimate read-only inspection, and a
+    # substring scan would flag it — the same docstring-versus-code confusion
+    # that has caught several checks in this repository already.
+    called = _called_methods(_module(WRITER)) | _constructed_types(_module(WRITER))
+    called |= {
+        node.func.id
+        for node in ast.walk(ast.parse(_module(WRITER).read_text()))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    for forbidden in (
+        "mkdir",
+        "makedirs",
+        "unlink",
+        "remove",
+        "rmdir",
+        "rmtree",
+        "rename",
+        "replace",
+        "chmod",
+        "chown",
+        "symlink",
+        "symlink_to",
+        "hardlink_to",
+        "link",
+        "utime",
+        "truncate",
+        "ftruncate",
+        "chdir",
+    ):
+        assert forbidden not in called, f"{WRITER} calls {forbidden}"
+
+    # The read-only inspections it *does* perform are named, so a future edit
+    # that swapped one for a mutating call would change this set.
+    assert {"is_symlink", "is_dir", "is_file", "exists"} <= called
+
+
+def test_the_writer_never_follows_a_symlink_when_opening() -> None:
+    """`O_NOFOLLOW` is present in the open flags, asserted against the AST.
+
+    A future edit that dropped the flag would still pass every behavioural test
+    that does not win the race, so the flag is pinned structurally as well.
+    """
+    source = _code_without_docstrings(_module(WRITER))
+    assert "o_nofollow" in source
+    assert "o_creat" in source and "o_trunc" in source
+    # And the only `open` in the module is the low-level one, never the
+    # symlink-following builtin or `Path.open`.
+    tree = ast.parse(_module(WRITER).read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id != "open", "the writer uses the builtin open"
+
+
+def test_the_mutation_check_actually_catches_a_mutating_call() -> None:
+    """Adversarial control: a writer that removed a file must be caught."""
+    import tempfile
+
+    poisoned = "def go(target):\n    target.unlink()\n    target.chmod(0o777)\n"
+    with tempfile.TemporaryDirectory() as directory:
+        candidate = pathlib.Path(directory) / WRITER
+        candidate.write_text(poisoned)
+        assert {"unlink", "chmod"} <= _called_methods(candidate)
+
+    assert not {"unlink", "chmod"} & _called_methods(_module(WRITER))
+
+
+def test_the_nofollow_check_actually_catches_its_removal() -> None:
+    """Adversarial control: a writer without the flag must fail the same check."""
+    import tempfile
+
+    poisoned = _module(WRITER).read_text().replace("| os.O_NOFOLLOW", "")
+    with tempfile.TemporaryDirectory() as directory:
+        candidate = pathlib.Path(directory) / WRITER
+        candidate.write_text(poisoned)
+        assert "o_nofollow" not in _code_without_docstrings(candidate)
+
+    assert "o_nofollow" in _code_without_docstrings(_module(WRITER))
+
+
+def test_the_read_only_executor_did_not_acquire_a_write_primitive() -> None:
+    """Milestone 2's proof must still hold after Milestone 8.
+
+    The writer lives in its own module precisely so this stays true. If the
+    write had been added beside the readers, this assertion would have had to
+    be weakened — which is the outcome the separation exists to avoid.
+    """
+    reader = _module("workspace_fs.py")
+    roots = _imported_roots(ast.parse(reader.read_text()))
+    assert "os" not in roots
+    source = _code_without_docstrings(reader)
+    for forbidden in ("write_text", "write_bytes", "o_wronly", "o_creat", "fsync"):
+        assert forbidden not in source, f"workspace_fs.py acquired {forbidden}"
+
+
+def test_the_writer_cannot_reach_the_control_plane() -> None:
+    """It is an executor, and every executor rule applies to it."""
+    imported = _intra_package_imports(_module(WRITER))
+    for forbidden in sorted(AUTHORITY_MODULES):
+        assert forbidden not in imported, f"{WRITER} imports {forbidden}"
+    reachable = imported | _attribute_reads(_module(WRITER)) | _called_methods(_module(WRITER))
+    for forbidden in sorted(FORBIDDEN_POLICY_NAMES):
+        assert forbidden not in reachable, f"{WRITER} reaches {forbidden}"
+
+
+def test_the_writer_constructs_no_authority_object() -> None:
+    constructed = _constructed_types(_module(WRITER))
+    for forbidden in (
+        "RunContext",
+        "ToolRegistry",
+        "Controller",
+        "RunJournal",
+        "ExecutionAuthorized",
+        "ExecutionCompleted",
+        "RunTerminal",
+        "OperatorDecisionRecorded",
+    ):
+        assert forbidden not in constructed, f"{WRITER} constructs {forbidden}"
+
+
+def test_the_writer_invokes_no_other_capability_and_no_model() -> None:
+    """One capability performs one operation; it does not orchestrate."""
+    methods = _called_methods(_module(WRITER))
+    assert "execute" not in methods
+    assert "chat" not in methods
+    assert "executor" not in _attribute_reads(_module(WRITER))
+
+
+def test_the_writer_assigns_to_no_authority_attribute() -> None:
+    assert not _attribute_assignments(_module(WRITER)) & AUTHORITY_ATTRIBUTES
+
+
+def test_the_writer_is_admitted_and_classified_idempotent() -> None:
+    """The declaration itself, read from the shipping builder."""
+    from local_agent.executors.workspace_fs import PhysicalRoots
+    from local_agent.executors.workspace_write import (
+        WorkspaceWriteExecutor,
+        build_workspace_write_spec,
+    )
+    from local_agent.registry import SideEffect, admit
+
+    spec = build_workspace_write_spec(WorkspaceWriteExecutor(PhysicalRoots({})))
+    admit(spec)  # must not raise
+    assert spec.name == "workspace.write"
+    assert spec.side_effect is SideEffect.IDEMPOTENT
+    assert spec.re_executable is True
+    assert spec.side_effect_free is False
+    assert spec.requires_authorization is True
+    assert spec.destructive is False
+
+
+def test_the_write_size_limit_is_policy_authority_not_a_tool_argument() -> None:
+    """The ceiling belongs to `FilesystemLimits`; no schema exposes it."""
+    from local_agent.contracts import WorkspaceWriteArgs
+    from local_agent.policy import FilesystemLimits
+
+    assert "max_file_write_bytes" in {field.name for field in dataclasses.fields(FilesystemLimits)}
+    assert set(WorkspaceWriteArgs.model_fields) == {"root_id", "path", "content"}
+    for forbidden in ("max_file_write_bytes", "limit", "size", "bytes", "ceiling"):
+        assert forbidden not in WorkspaceWriteArgs.model_fields
+
+
+def test_the_writer_reads_no_environment_variable() -> None:
+    """The limit is infrastructure, not deployment-tunable behind the code's back."""
+    text = _module(WRITER).read_text()
+    for token in ("os.environ", "getenv", "environ["):
+        assert token not in text

@@ -121,6 +121,13 @@ GUARDED_PATH = re.compile(r"local-agent/src/local_agent/.*\.py$")
 #                    along because the stdlib client is blocking)
 #   journal.py       Milestone 5: the only writer of durable state (`fcntl`
 #                    is the advisory lock that stops two live recoveries)
+#   workspace_write.py
+#                    Milestone 8: the only writer of workspace artifacts. It
+#                    holds `os` and not `pathlib` — it receives already-resolved
+#                    paths from `workspace_fs` and constructs none, so it has
+#                    strictly less filesystem surface than the reader it
+#                    borrows containment from. Kept a separate module precisely
+#                    so `workspace_fs.py` stays provably read-only.
 #
 # `persistence/records.py` needs no entry: its `hashlib` and `uuid` imports are
 # not capabilities and are not on the forbidden list. The architecture test
@@ -129,6 +136,7 @@ MODULE_GRANTS = {
     "workspace_fs.py": {"pathlib"},
     "http.py": {"urllib"},
     "journal.py": {"os", "pathlib"},
+    "workspace_write.py": {"os"},
     # Milestone 7: `registry.py` content-addresses a capability. Neither
     # `hashlib` nor `types` (for MappingProxyType) performs I/O, opens a
     # socket, or reads ambient state, and neither is on the forbidden list —

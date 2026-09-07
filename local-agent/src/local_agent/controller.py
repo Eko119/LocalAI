@@ -48,6 +48,7 @@ from .persistence.records import (
     DurableRecord,
     ExecutionAuthorized,
     ExecutionCompleted,
+    JournalError,
     OperatorAction,
     OperatorDecisionRecorded,
     RunStarted,
@@ -370,7 +371,7 @@ class Controller:
                         spec.name,
                         args.model_dump(mode="json"),
                     )
-                    self._persist(
+                    self._persist_authorization(
                         ExecutionAuthorized(
                             run_id=run_context.run_id,
                             step_id=step_id,
@@ -380,7 +381,8 @@ class Controller:
                             execution_id=execution_id,
                             side_effect_free=spec.side_effect_free,
                             capability_digest=capability_digest(spec),
-                        )
+                        ),
+                        recorder,
                     )
                 # From here on a physical effect may have occurred, so this
                 # is set before the call rather than after it.
@@ -753,6 +755,33 @@ class Controller:
             attempt=fresh.attempt,
             execution_id=rederived,
         )
+
+    def _persist_authorization(self, record: DurableRecord, recorder: EventRecorder) -> None:
+        """Write the write-ahead record, or refuse the attempt cleanly.
+
+        Every other durable write in this class may propagate a `JournalError`,
+        because at those points either nothing is pending or the physical call
+        has already happened and a loud failure is the honest outcome. This one
+        is different: it sits immediately before the executor, so a raised
+        error here means *nothing ran*, and the correct outcome is a refusal
+        rather than an exception escaping `run()`.
+
+        Milestone 8 made this reachable. Arguments are persisted, and a write
+        capability's `content` is the first argument large enough to approach
+        `records.MAX_ARGUMENTS_BYTES` — worst-case JSON escaping inflates a
+        payload six-fold, so a content field inside the capability's own
+        ceiling can still exceed the record ceiling. Measured on the Milestone 7
+        tree, that propagated out of `run()` as an unhandled `JournalError`.
+
+        The refusal is `POLICY_DENIED`: non-retryable, because the same
+        arguments would fail identically, and opaque, because which ceiling was
+        hit is controller-internal. The real reason goes to the audit stream.
+        """
+        try:
+            self._persist(record)
+        except JournalError as exc:
+            recorder.record("authorization_not_persistable", reason=exc.reason)
+            raise _Rejection("POLICY_DENIED", _DENIED_MESSAGE) from exc
 
     def _enter(self, machine: Run, recorder: EventRecorder, state: State) -> None:
         machine.advance(state)

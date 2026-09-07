@@ -157,9 +157,34 @@ Milestone 5's semantics are unchanged and are **not** strengthened here:
 
 * the system does not provide exactly-once execution, in general or under
   recovery, and does not use the phrase where it cannot enforce it;
-* `NONE` is at-least-once and observationally equivalent to exactly-once
-  *because of the capability*, not because of the controller;
-* everything else is at-most-once, with an explicit `execution_unknown`.
+* the controller never re-executes automatically after an ambiguous crash. An
+  authorization with no completion is `execution_unknown` and needs an
+  operator, for every classification. That is the whole of the crash-path
+  guarantee, and it is a property of the *controller*;
+* a *known* failure is different from an ambiguous one, and there the retry
+  gate may run a capability again within a finite budget. So the number of
+  physical attempts can exceed one by design — measured at three for the
+  Milestone 8 writer — while remaining bounded and terminal on exhaustion.
+
+Milestone 8 corrected the framing this section originally used. Delivery
+semantics like *at-most-once* and *at-least-once* describe a **mechanism**, and
+the mechanism here is the controller's write-ahead record plus its refusal to
+resume ambiguity — not the capability's classification. Saying "`NONE` is
+at-least-once" and "everything else is at-most-once" attached a delivery
+guarantee to a label that does not carry one, and both halves were wrong in a
+way that mattered:
+
+* `NONE` does not promise *at least* one execution — a run can fail before
+  EXECUTE and never reach the capability at all. What `NONE` says is that
+  repetition is unobservable, so how many times it ran is a question with no
+  observable answer;
+* `IDEMPOTENT` is emphatically not *at most* once. The writer really does
+  perform three physical writes across three attempts. What `IDEMPOTENT` says
+  is that the observable end state converges regardless of the count.
+
+The classification answers "is repeating safe" and "did anything happen". It
+does not answer "how many times did this run", and it should not be written as
+though it did.
 
 Note the asymmetry the three-way split makes visible: an `IDEMPOTENT`
 capability is safe to **retry** after a *known* failure and is still

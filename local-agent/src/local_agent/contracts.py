@@ -180,6 +180,69 @@ class WorkspaceListResult(_Strict):
 
 
 # --------------------------------------------------------------------------
+# Constrained artifact writer (Milestone 8)
+# --------------------------------------------------------------------------
+
+# A structural ceiling on the *characters* a write may carry, which exists only
+# so a hostile payload cannot force the executor to encode an enormous string
+# before the byte ceiling is applied. The authoritative bound is
+# `policy.FilesystemLimits.max_file_write_bytes`, enforced on encoded UTF-8
+# bytes inside the executor; this one stands to it exactly as `MAX_PATH_LENGTH`
+# stands to `FilesystemLimits.max_path_length`.
+#
+# Four bytes is the maximum a single character can occupy in UTF-8, so a string
+# within this bound can never encode to more than four times the byte ceiling.
+MAX_WRITE_CONTENT_CHARS = 4 * 8_192
+
+
+class WorkspaceWriteArgs(_Strict):
+    """Arguments for `workspace.write`.
+
+    Note what is absent, and that the absences are the contract rather than a
+    simplification. There is no mode, no append flag, no encoding, no offset,
+    no permission, no owner, no "create parents", no follow-symlinks switch,
+    and no root path. The capability does exactly one thing — put these bytes
+    at this abstract location — so there is no parameter through which it could
+    be asked to do a second thing.
+
+    `path` reuses `RelativePath`, the same canonical grammar the read
+    capability uses. A second path grammar for writes would be a second place
+    for a traversal bug to live; `min_length=1` is the only difference, because
+    a write must name a file and the empty path denotes the root directory.
+    """
+
+    root_id: RootId
+    path: RelativePath = Field(min_length=1, max_length=MAX_PATH_LENGTH)
+    # Text, not bytes, and validated as such. The read capability already
+    # refuses non-UTF-8 content; accepting arbitrary bytes here would make the
+    # pair asymmetric and would need a base64 channel the model could misuse.
+    # The empty string is legal: creating or truncating a file to zero bytes is
+    # a coherent request, and refusing it would be an arbitrary exception.
+    content: str = Field(max_length=MAX_WRITE_CONTENT_CHARS)
+
+
+class WorkspaceWriteResult(_Strict):
+    """Result schema for `workspace.write`.
+
+    Operational facts only. `root_id` and `path` echo the caller's own abstract
+    request; `bytes_written` is what was encoded; `created` says whether the
+    destination existed beforehand.
+
+    `created` discloses strictly less than the read capability already does —
+    whether a file exists inside a root the run holds a grant for — and a
+    caller needs it to tell "I made this" from "I replaced this". No physical
+    path, device, inode, mode, owner, or timestamp appears anywhere in this
+    shape, and none is collected in order to be omitted.
+    """
+
+    status: Literal["success", "error"]
+    root_id: RootId
+    path: str
+    bytes_written: int
+    created: bool
+
+
+# --------------------------------------------------------------------------
 # Model <-> controller channel
 # --------------------------------------------------------------------------
 

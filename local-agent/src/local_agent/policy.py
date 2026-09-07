@@ -57,6 +57,20 @@ class FilesystemLimits:
     # Bytes, not characters. UTF-8 text can spend several bytes per character,
     # so a character-based limit would not bound memory or transfer.
     max_file_read_bytes: int = 262_144  # 256 KiB
+    # Milestone 8. Deliberately a *separate* field rather than a reuse of the
+    # read ceiling, because the two bound different resources and a shared
+    # value would let one be raised for one reason and silently widen the
+    # other. A read bounds transient memory and how much reaches the model's
+    # context; a write bounds durable disk consumption inside a workspace and,
+    # because the arguments are persisted, how much lands in a journal record.
+    #
+    # The value is an order of magnitude below the read ceiling and below
+    # `records.MAX_ARGUMENTS_BYTES` (16 KiB), so an ordinary payload is bounded
+    # by the capability rather than by the persistence layer. Worst-case JSON
+    # escaping (a payload of control characters inflates six-fold) can still
+    # exceed the record ceiling; that is a clean, non-retryable refusal rather
+    # than a crash — see `Controller._persist_authorization`.
+    max_file_write_bytes: int = 8_192  # 8 KiB
     max_directory_entries: int = 1_000
     # May tighten, never widen, the schema's structural MAX_PATH_LENGTH.
     max_path_length: int = 1_024
@@ -66,6 +80,7 @@ class FilesystemLimits:
     def __post_init__(self) -> None:
         for name in (
             "max_file_read_bytes",
+            "max_file_write_bytes",
             "max_directory_entries",
             "max_path_length",
             "max_serialized_result_bytes",

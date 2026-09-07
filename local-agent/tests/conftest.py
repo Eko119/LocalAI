@@ -765,3 +765,191 @@ def build_recovery_harness(
         registry=resolved_registry,
         run_context=run_context or crashed.run_context,
     )
+
+
+# ---------------------------------------------------------------------------
+# Milestone 8: the constrained artifact writer
+# ---------------------------------------------------------------------------
+#
+# The writer is the first capability where "the executor was dispatched" and
+# "bytes reached a disk" are different facts, so its fixtures keep both spies
+# and every test asserts the second one.
+
+
+@dataclass
+class WriteFixture:
+    """An isolated tree plus everything needed to drive a real governed write.
+
+    `outside` and its sentinel file exist so an escape has somewhere to land.
+    A containment test that cannot fail is not a containment test.
+    """
+
+    base: Path
+    workspace: Path
+    knowledge: Path
+    outside: Path
+    roots: PhysicalRoots
+
+    @property
+    def outside_sentinel(self) -> Path:
+        return self.outside / "secret.txt"
+
+    def outside_intact(self) -> bool:
+        return self.outside_sentinel.read_text(encoding="utf-8") == OUTSIDE_SENTINEL_TEXT
+
+
+OUTSIDE_SENTINEL_TEXT = "TOP SECRET EXTERNAL DATA\n"
+
+
+def build_write_tree(base: Path) -> WriteFixture:
+    """A workspace with every destination shape the file-type policy names."""
+    workspace = base / "workspace"
+    knowledge = base / "knowledge"
+    outside = base / "external"
+    for directory in (workspace, knowledge, outside):
+        directory.mkdir(parents=True)
+
+    (outside / "secret.txt").write_text(OUTSIDE_SENTINEL_TEXT, encoding="utf-8")
+    (workspace / "existing.txt").write_text("original\n", encoding="utf-8")
+    (workspace / "nested").mkdir()
+    (workspace / "nested" / "deep.txt").write_text("deep\n", encoding="utf-8")
+    (workspace / "a_directory").mkdir()
+
+    # Every destination type the policy has to answer for.
+    os.symlink(outside / "secret.txt", workspace / "link_outside.txt")
+    os.symlink(workspace / "existing.txt", workspace / "link_inside.txt")
+    os.symlink(workspace / "missing_target", workspace / "link_broken.txt")
+    os.symlink(knowledge, workspace / "link_other_root")
+    # A symlinked *directory* pointing outside. This is the case `O_NOFOLLOW`
+    # does not cover — that flag guards only the final component — so it is
+    # what the strict parent resolution has to catch. Measured: without the
+    # parent resolution, `os.open` follows this and writes outside the root.
+    os.symlink(outside, workspace / "link_dir_outside")
+    os.mkfifo(workspace / "a_fifo")
+
+    return WriteFixture(
+        base=base,
+        workspace=workspace,
+        knowledge=knowledge,
+        outside=outside,
+        roots=build_physical_roots({"workspace": workspace, "knowledge": knowledge}),
+    )
+
+
+@pytest.fixture
+def write_tree(tmp_path: Path) -> WriteFixture:
+    return build_write_tree(tmp_path)
+
+
+def write_proposal(path: str, content: str, root_id: str = "workspace") -> str:
+    return json.dumps(
+        {
+            "tool": "workspace.write",
+            "arguments": {"root_id": root_id, "path": path, "content": content},
+        }
+    )
+
+
+@dataclass
+class WriteHarness:
+    """A controller wired to the production writer over an isolated tree."""
+
+    fixture: WriteFixture
+    executor: Any
+    adapter: ScriptedModelAdapter
+    controller: Controller
+    run_context: RunContext
+    journal: Any = None
+
+    @property
+    def writes(self) -> int:
+        """Physical writes. The number that decides whether a refusal is real."""
+        return int(self.executor.write_count)
+
+    def run(self) -> RunOutcome:
+        return asyncio.run(
+            self.controller.run(self.run_context, [{"role": "user", "content": "write it"}])
+        )
+
+
+def build_write_harness(
+    fixture: WriteFixture,
+    responses: Sequence[ModelResponse] | ModelResponse,
+    run_context: RunContext | None = None,
+    limits: FilesystemLimits = DEFAULT_FILESYSTEM_LIMITS,
+    executor: Any = None,
+    journal: Any = None,
+    run_id: str = "run-write",
+) -> WriteHarness:
+    """Wire the production writable registry, keeping the writer as a spy."""
+    from local_agent.executors.workspace_write import WorkspaceWriteExecutor
+    from local_agent.wiring import build_writable_filesystem_registry, build_writable_run_context
+
+    if isinstance(responses, ModelResponse):
+        responses = (responses,)
+    write_executor = executor or WorkspaceWriteExecutor(fixture.roots, limits)
+    adapter = ScriptedModelAdapter(tuple(responses))
+    registry = build_writable_filesystem_registry(
+        fixture.roots, limits, write_executor=write_executor
+    )
+    return WriteHarness(
+        fixture=fixture,
+        executor=write_executor,
+        adapter=adapter,
+        controller=Controller(registry, adapter, journal=journal),
+        run_context=run_context or build_writable_run_context(run_id, limits=limits),
+        journal=journal,
+    )
+
+
+class WriteThenFailExecutor:
+    """Performs a real, measurable write and then raises a retryable error.
+
+    The Milestone 8 test of Milestone 7's retry gate. Counting `writes` after a
+    run answers the only question that matters for a side-effecting capability:
+    how many irreversible acts did a budget of three actually authorize?
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.calls: list[Any] = []
+        self.writes: list[Any] = []
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    @property
+    def write_count(self) -> int:
+        return len(self.writes)
+
+    def execute(self, args: Any) -> Any:
+        from local_agent.registry import ToolExecutionError
+
+        self.calls.append(args)
+        self._inner.execute(args)  # the physical effect really happens
+        self.writes.append(args)
+        raise ToolExecutionError("downstream hiccup after the write landed")
+
+
+class CrashAfterWriteExecutor(RecordingExecutor):
+    """Writes for real, then dies before the controller learns it happened.
+
+    Crash window D for a side-effecting capability: the artifact is on disk and
+    no completion evidence exists.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        super().__init__()
+        self._inner = inner
+        self.writes: list[Any] = []
+
+    @property
+    def write_count(self) -> int:
+        return len(self.writes)
+
+    def execute(self, args: Any) -> Any:
+        self.calls.append(args)
+        self._inner.execute(args)
+        self.writes.append(args)
+        raise SimulatedCrash("during:write_completion")

@@ -76,11 +76,54 @@ must remain unable to perform the operations they authorize.
   filesystem failure is translated to a slug at the point it is caught. On
   CPython 3.11 a symlink loop raises `RuntimeError`, not `OSError`, with the
   host path in the message — catch both.
-- **Read-only is structural.** No mutating method is called anywhere in the
-  executor and `open` is only ever passed `"rb"`; both are asserted against
-  the module's AST. Do not add a generic operation seam.
+- **Read-only is structural.** No mutating method is called anywhere in
+  `workspace_fs.py` and `open` is only ever passed `"rb"`; both are asserted
+  against the module's AST. The writer lives in a *separate* module
+  (`workspace_write.py`) with its own grant precisely so those proofs keep
+  holding — never move a mutation into the reader. Do not add a generic
+  operation seam to either.
 - **Ceilings reject, never truncate.** A shortened file or listing cannot be
   distinguished from a complete one by whoever reads it next.
+
+### Writing (Milestone 8)
+
+- **Containment is reused, never reimplemented.** The writer resolves the
+  destination's *parent* through the same `_resolve_within_root` the reader
+  uses. There is one containment implementation in this package; a second one
+  would be a second place for a traversal bug to live.
+- **A missing parent is a refusal, and that is the enforcement.** There is no
+  `mkdir` anywhere in the writer, so "never creates directories" is a
+  consequence of resolving strictly rather than a guard someone could forget.
+- **`O_NOFOLLOW` is the symlink defence; the pre-check is not.** A pre-flight
+  `is_symlink()` is racy by construction. The flag moves the check into the
+  same syscall as the open, so the kernel refuses instead of this code hoping.
+  Never replace it with a check, and never add a "resolve the link if it stays
+  inside" path — the reader may follow links, a writer may not, because "still
+  points inside" has a lifetime shorter than the write.
+- **`O_NOFOLLOW` guards only the final component.** A symlinked *parent
+  directory* is followed by the kernel and writes outside the root — measured,
+  not assumed. The strict parent resolution is therefore load-bearing, not
+  tidiness. Never relax it to `root / parent` "since the leaf is guarded".
+- **The non-regular-destination check has nothing behind it.** Unlike the
+  symlink and directory checks — where the flag and `EISDIR` still hold — a
+  FIFO opened for writing without `O_NONBLOCK` blocks until a reader appears,
+  and `ToolSpec.timeout_seconds` is recorded but never enforced with a clock.
+  Removing this check hangs the controller on a model-proposed path. It
+  defends *liveness*, and it is tested by ordering (`os.open` is never reached)
+  rather than by outcome, because a hang is not a failure.
+- **The write ceiling is its own field, and its value is coupled.**
+  `max_file_write_bytes` bounds durable disk and journal-record size; the read
+  ceiling bounds transient memory and model context. Never collapse them. The
+  write ceiling must stay below `records.MAX_ARGUMENTS_BYTES`, or a payload
+  the capability allows gets refused by the persistence layer instead.
+- **Not atomic, not transactional, not exactly-once.** `O_TRUNC` empties the
+  file at open, so a crash mid-write leaves a file shorter than either
+  version. Do not describe the writer with any of those words. What is claimed
+  and tested: the bytes are `fsync`ed before the call returns, nothing lands
+  outside the authorized root, and an identical request converges.
+- **`IDEMPOTENT` is bounded to the destination's existence and content.**
+  `mtime` does not converge, and a test asserts that it does not. Do not widen
+  the claim to filesystem metadata or to an external observer.
 
 ## The model boundary
 

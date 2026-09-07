@@ -33,6 +33,8 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
 | whether an error is retryable | `contracts.RETRYABLE_CODES` | per-call judgement |
 | which physical directory a root id means | `wiring.build_physical_roots` | anything the model sent |
 | whether a resolved path is inside its root | `workspace_fs._resolve_within_root` | a string prefix test |
+| whether a *write* destination is inside its root | the same helper, on the destination's **parent**, plus `O_NOFOLLOW` on the leaf | a second containment implementation |
+| whether a destination's file type is writable | `workspace_write.execute`, before the open | an errno discovered afterwards |
 | filesystem resource ceilings | `policy.FilesystemLimits` | a tool argument |
 | where the model service lives | `model_config.ModelServiceConfig` | model output, ever |
 | model timeout and response ceilings | `model_config.ModelServiceConfig` | the model, or a tool argument |
@@ -72,10 +74,14 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
    `ToolSpec` — same argument schema, same result schema — so swapping it is a
    wiring change, not a controller change.
 7. **Physical capability is granted per module, never globally.**
-   `executors/workspace_fs.py` holds the only filesystem *read* grant,
-   `persistence/journal.py` the only durable *write* grant, and
-   `transports/http.py` the only network grant. To give another module one, add
-   it to `MODULE_IMPORT_GRANTS` deliberately and say why — never widen
+   `executors/workspace_fs.py` holds the only workspace *read* grant,
+   `executors/workspace_write.py` the only workspace *write* grant,
+   `persistence/journal.py` the only durable-state write grant, and
+   `transports/http.py` the only network grant. Reading and writing a
+   workspace are deliberately two modules and two grants: the reader's
+   read-only proofs are AST assertions, and a writer beside it would have to
+   weaken them. To give another module a grant, add it to
+   `MODULE_IMPORT_GRANTS` deliberately and say why — never widen
    `ALLOWED_IMPORTS`, which would grant it to the controller and the policy
    gates too.
 8. **Capabilities are named, not parameterised.** There is no
@@ -143,7 +149,26 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
     `SideEffect` into a boolean, never store `side_effect_free` or
     `re_executable`, and never equate either with retryability. The retry
     branch is `error.retryable AND (nothing ran OR re_executable) AND budget`.
-22. **Detect what you cannot prevent.** A capability's schemas are mutable
+22. **A side effect is one named operation, never a seam.** `workspace.write`
+    replaces one regular file and does nothing else. A new filesystem
+    operation means a new module, a new schema, a new registry entry and new
+    tests — never a mode argument, an operation name, or a `writable=True`
+    flag. The writable registry and run context are separate *builders* for
+    the same reason: a flag is one edit away from being passed by a caller who
+    did not think about it.
+23. **Reuse containment; adapt at the edge.** `_resolve_within_root` resolves
+    strictly and cannot resolve a file that does not exist, so the writer
+    resolves the *parent* through it and handles the single remaining
+    component with `O_NOFOLLOW`. Never fork the helper, never add a
+    non-strict mode to it, and never conclude that the leaf's flag makes the
+    parent's resolution optional — it guards only the last component.
+24. **Enforcement belongs where it is unraceable.** A pre-flight type check
+    that the kernel could invalidate before the syscall is diagnosis. Prefer a
+    flag on the syscall itself, and say plainly in the code which of the two a
+    given check is — with one exception recorded at its site: the
+    non-regular-destination check has no syscall behind it and prevents an
+    unbounded block, so it is enforcement.
+25. **Detect what you cannot prevent.** A capability's schemas are mutable
     classes, so `capability_digest` exists because freezing them is impossible.
     Never describe the digest as a tamper seal, and never treat a missing
     digest as a verified one.

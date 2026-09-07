@@ -20,6 +20,7 @@ from .executors.workspace_fs import (
     build_workspace_list_spec,
     build_workspace_read_spec,
 )
+from .executors.workspace_write import WorkspaceWriteExecutor, build_workspace_write_spec
 from .model_adapter import ModelAdapter
 from .model_config import ModelServiceConfig
 from .model_service import LocalAIModelAdapter, ToolDescription
@@ -75,6 +76,36 @@ def build_filesystem_registry(
     )
 
 
+def build_writable_filesystem_registry(
+    roots: PhysicalRoots,
+    limits: FilesystemLimits = DEFAULT_FILESYSTEM_LIMITS,
+    read_executor: ToolExecutor | None = None,
+    list_executor: ToolExecutor | None = None,
+    write_executor: ToolExecutor | None = None,
+) -> ToolRegistry:
+    """The Milestone 8 registry: the two readers plus the one artifact writer.
+
+    A *separate* builder rather than a flag on `build_filesystem_registry`.
+    Every existing caller of that function keeps a registry with no write
+    capability in it at all — a deployment cannot acquire the ability to mutate
+    a workspace by upgrading, only by deliberately calling this instead. That
+    is the same reasoning that makes capabilities named rather than
+    parameterised: `include_writer=True` would be one keyword away from being
+    set by accident, and one keyword is not enough distance for a side effect.
+
+    There is still no delete, rename, move, mkdir, chmod, or shell capability
+    to register. The guarantee remains structural: a mutating request that is
+    not "replace this one file" cannot be routed anywhere.
+    """
+    return ToolRegistry(
+        (
+            build_workspace_read_spec(read_executor or WorkspaceReadExecutor(roots, limits)),
+            build_workspace_list_spec(list_executor or WorkspaceListExecutor(roots, limits)),
+            build_workspace_write_spec(write_executor or WorkspaceWriteExecutor(roots, limits)),
+        )
+    )
+
+
 def build_filesystem_run_context(
     run_id: str,
     authorized_roots: frozenset[str] = frozenset(LEGAL_ROOT_IDS),
@@ -95,6 +126,29 @@ def build_filesystem_run_context(
     )
 
 
+def build_writable_run_context(
+    run_id: str,
+    authorized_roots: frozenset[str] = frozenset(LEGAL_ROOT_IDS),
+    limits: FilesystemLimits = DEFAULT_FILESYSTEM_LIMITS,
+    max_attempts: int = 3,
+) -> RunContext:
+    """A run granted the two readers *and* the artifact writer.
+
+    Separate from `build_filesystem_run_context` for the same reason the
+    registry builder is separate: a run that was only ever meant to read must
+    not gain a write grant because a default changed. The two grants are
+    independent — a run can hold the registry containing the writer and still
+    not be authorized to use it, and `authorize` will refuse it.
+    """
+    return RunContext(
+        run_id=run_id,
+        max_attempts=max_attempts,
+        authorized_tools=frozenset({"workspace.read", "workspace.list", "workspace.write"}),
+        authorized_roots=authorized_roots,
+        filesystem=limits,
+    )
+
+
 # What the model is told each tool is for. Kept here, in trusted wiring, rather
 # than on `ToolSpec`: these strings are written for the model to read, and
 # nothing in the controller consults them.
@@ -102,6 +156,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "workspace.read": "Read UTF-8 text from a file in an authorized root.",
     "workspace.list": "List the entries of a directory in an authorized root.",
     "file_search": "Search for files matching a query in an authorized root.",
+    "workspace.write": "Create or replace one file in an authorized root with the given text.",
 }
 
 

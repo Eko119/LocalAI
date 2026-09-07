@@ -10,8 +10,9 @@ package, summarised in [`docs/milestone-1-decisions.md`](docs/milestone-1-decisi
 [`docs/milestone-3-decisions.md`](docs/milestone-3-decisions.md),
 [`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md),
 [`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md),
-[`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md), and
-[`docs/milestone-7-decisions.md`](docs/milestone-7-decisions.md). Where this
+[`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md),
+[`docs/milestone-7-decisions.md`](docs/milestone-7-decisions.md), and
+[`docs/milestone-8-decisions.md`](docs/milestone-8-decisions.md). Where this
 file and that package disagree, the package wins, and the disagreement should be
 written down rather than resolved silently.
 
@@ -29,8 +30,9 @@ those, it is wrong regardless of how well it works.
 
 Milestones 1 (deterministic control plane), 2 (read-only filesystem),
 3 (production model adapter), 4 (live integration hardening), 5 (durable run
-state and crash recovery), 6 (operator-controlled recovery) and 7 (the
-capability contract) are complete and gated by CI.
+state and crash recovery), 6 (operator-controlled recovery), 7 (the capability
+contract) and 8 (the constrained artifact writer) are complete and gated by
+CI.
 
 **Milestone 4 is hardened but not yet observed live.** No LocalAI instance was
 reachable where it was written, so the four live scenarios are implemented and
@@ -43,10 +45,11 @@ policy, retry budget, parser boundary, audit events, the `workspace.read` /
 `workspace.list` capability, the LocalAI model adapter and its transport, the
 durable run journal with its recovery and replay, the operator control plane
 (inspection, decisions, approved resume, abort), the capability admission
-contract, and tests.
+contract, the `workspace.write` capability, and tests.
 
-**Explicitly out of scope until a later milestone opens it:** writes to a
-workspace, shell or subprocess execution, Playwright or any browser, network
+**Explicitly out of scope until a later milestone opens it:** every filesystem
+mutation other than replacing one regular file — delete, rename, mkdir, chmod,
+copy, append — shell or subprocess execution, Playwright or any browser, network
 access outside the model transport, MCP, Docker code execution, Qdrant, SQLite,
 Gemma, llama.cpp, OS-level sandboxing, distributed coordination, automatic
 *unattended* resumption, authenticated operator identity, and a CLI binary.
@@ -54,10 +57,15 @@ Gemma, llama.cpp, OS-level sandboxing, distributed coordination, automatic
 adding `import subprocess` fails the suite, it does not merely violate a
 convention.
 
-**Capability grants are per module.** `executors/workspace_fs.py` and
-`persistence/journal.py` are the only production files allowed to touch a disk,
-and `transports/http.py` is the only one allowed a network import. All grants
-live in `MODULE_IMPORT_GRANTS` in the architecture test and are mirrored in
+**Capability grants are per module.** `executors/workspace_fs.py`,
+`executors/workspace_write.py` and `persistence/journal.py` are the only
+production files allowed to touch a disk, and `transports/http.py` is the only
+one allowed a network import. Reading a workspace and writing one are separate
+grants held by separate modules on purpose: `workspace_fs.py` is *provably*
+read-only — its AST is asserted to call no mutating method and to open files
+only in `"rb"` — so putting a writer beside it would have meant weakening those
+assertions rather than adding to them. All grants live in
+`MODULE_IMPORT_GRANTS` in the architecture test and are mirrored in
 `.claude/hooks/milestone_scope_guard.py`; keep the two in step. Never widen the
 global allowlist to solve a one-module need — a global widening is exactly how
 the controller would quietly acquire filesystem or network access later.
@@ -90,6 +98,20 @@ into a boolean, and never equate `side_effect_free` with retryable — an
 idempotent capability is safe to retry while emphatically having had an effect.
 The controller's retry branch consults `re_executable`; before Milestone 7 it
 did not, and a failing `MUTATING` capability ran once per attempt.
+
+**A side effect is governed, not merely permitted.** `workspace.write` replaces
+one regular file beneath one authorized root and does nothing else — no delete,
+no rename, no mkdir, no chmod, no append, no mode selector. Containment is the
+*existing* helper: the destination's parent is resolved strictly through
+`_resolve_within_root`, which both proves containment and makes a missing
+parent a refusal, and the final component is opened with `O_NOFOLLOW` so the
+symlink check is unraceable. Two facts that look like tidiness and are not:
+`O_NOFOLLOW` guards only the last component, so the strict parent resolution is
+what stops a symlinked directory escaping; and the non-regular-destination
+check has no second mechanism behind it, because opening a FIFO without
+`O_NONBLOCK` blocks forever and no timeout is enforced anywhere. Never widen
+this into a generic filesystem seam — a new operation must mean a new module, a
+new schema, a new registry entry and new tests.
 
 **A capability is content-addressed because immutability cannot reach its
 schemas.** `args_schema` and `result_schema` are classes and Python classes are
@@ -169,9 +191,12 @@ commands CI runs, in the same order.
       executors/
         file_search.py  Milestone 1 deterministic fake
         workspace_fs.py read-only filesystem — sole holder of a read grant
+        workspace_write.py the constrained artifact writer — sole holder of a
+                        workspace write grant
       persistence/
         records.py      versioned durable record contracts (pure, no I/O)
-        journal.py      append-only journal — sole holder of a write grant
+        journal.py      append-only journal — sole holder of the *durable
+                        state* write grant
       transports/
         http.py         sole holder of a network grant
     tests/              unit, adversarial, authority, filesystem, model,
