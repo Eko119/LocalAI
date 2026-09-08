@@ -63,7 +63,7 @@ def test_authorization_and_policy_rejections_are_separately_auditable() -> None:
 
 
 def test_retry_events_record_the_attempt_progression() -> None:
-    outcome = build_harness(_resp(tool_call_json(root_id="workspace"))).run()
+    outcome = build_harness(_resp(tool_call_json(root_id="workspace")), complete=False).run()
     retries = [dict(e.detail) for e in outcome.events if e.type == "retry"]
     assert retries == [
         {"attempt": 1, "next_attempt": 2},
@@ -86,7 +86,7 @@ def test_audit_events_never_carry_model_or_argument_text() -> None:
 
 
 def test_retry_budget_remaining_counts_down_correctly() -> None:
-    harness = build_harness(_resp(tool_call_json(root_id="workspace")))
+    harness = build_harness(_resp(tool_call_json(root_id="workspace")), complete=False)
     harness.run()
 
     errors = [
@@ -104,6 +104,7 @@ def test_a_custom_budget_is_honoured_exactly() -> None:
     harness = build_harness(
         _resp(tool_call_json(root_id="workspace")),
         run_context=RunContext(run_id="r", max_attempts=5),
+        complete=False,
     )
     outcome = harness.run()
 

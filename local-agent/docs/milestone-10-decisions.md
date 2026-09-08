@@ -1,14 +1,13 @@
 # Milestone 10 — State Machine Coherence Under Composition
 
-**Status: STOPPED before production code.** Phase 1 inspection found that the
-existing model/proposal contract has no representation for *"another execution
-is requested"* or *"no further execution is required"*. Under the Phase 1
-instruction — *"A missing contract is a finding, not an invitation to invent
-architecture"* — this document records the finding, the design that is ready to
-proceed once the contract question is settled, and the alternatives that were
-rejected and why.
+Phase 1 stopped: the model-facing contract had no affirmative representation for
+*"no further execution is requested"*, and the only available signal — absence
+of a tool proposal — was already committed, by design and by a named test, to
+meaning *malformed, retry*. That finding was accepted and the contract question
+resolved by decision rather than by reinterpretation.
 
-No production file was modified. The repository remains at the M9 baseline.
+**Phase 2 implements the resolution.** The M9 invariant stands untouched:
+absence of a structured tool proposal is still failure, never completion.
 
 ## 1. Baseline
 
@@ -64,142 +63,137 @@ not bound composition, and conflating the two would be the same category error
 Milestone 8 recorded when it asked a containment mechanism to cover an
 availability failure.
 
-## 4. Composition mechanism — the blocking finding
+## 4. Composition mechanism and the completion contract
 
-The intended shape was: a successful execution may proceed to another
-execution **when the existing contract explicitly requests one**. Phase 1's
-first task was to determine how that request is represented. It is not.
+### The Phase 1 finding, preserved
 
-### What the contract can express
+`ModelResponse` carries exactly `reasoning`, `narrative`, `structured_output`;
+`RawToolCall` exactly `tool` and `arguments`; both forbid extra fields, so
+neither could express completion — verified by construction. The one available
+signal, presence or absence of a tool call, is bound by
+`test_a_response_with_no_tool_call_fails_closed` and by three docstrings in
+`model_service.py` to the fail-closed malformed path. Measured: a prose-only
+response makes 3 model calls and terminates `failed / RETRY_EXHAUSTED`.
 
-Measured, not inferred:
+That is why `RESPOND → GENERATE` alone would have produced a broken run rather
+than composition, and why reinterpreting absence as completion was rejected:
+it would have made model silence mean task success, inverting the fail-closed
+discipline M5 and M9 established.
 
-| Type | Fields | Extra fields |
-|---|---|---|
-| `ModelResponse` | `reasoning`, `narrative`, `structured_output` | forbidden |
-| `RawToolCall` | `tool`, `arguments` | forbidden |
-| `ModelRequest` | `run_id`, `step_id`, `attempt`, `messages`, `feedback` | forbidden |
+### The chosen shape: `ExecutionComplete`
 
-`ModelResponse(structured_output=None, done=True)` raises `ValidationError`.
-`RawToolCall(tool="x", arguments={}, final=True)` raises `ValidationError`.
-Neither type has vocabulary for completion or continuation, and `extra="forbid"`
-means that is enforced rather than conventional.
+```python
+class ExecutionComplete(_Strict):
+    type: Literal["execution_complete"]
+```
 
-### Why the absence of a proposal cannot be reused as "done"
+One field, no default, on the structured channel the controller already trusts.
+The reasoning behind each property:
 
-The only signal available is presence or absence of a tool call on the
-structured channel — and that is **already bound, by design and by a named
-test, to a different meaning**.
+**Why a `type` tag rather than a boolean.** `type: Literal[...]` is the
+project's existing discriminator convention — every durable record in
+`records.py` carries one. A boolean like `{"complete": true}` would raise the
+question of what `{"complete": false}` means, and a field whose false value is
+meaningless is a field that will eventually be misread.
 
-`model_service.py` states it three times in its own docstrings:
+**Why the tag is required rather than defaulted.** The records use
+`type: Literal["run_started"] = "run_started"` because they are constructed in
+Python. This one arrives from the wire, so a default would make the empty
+object `{}` validate as completion — reintroducing exactly the
+absence-means-completion hazard Phase 1 rejected. The tag is required, so
+completion must be stated.
 
-> *"Fail closed, never fall back. If `tool_calls` is absent, empty, or
-> ambiguous, `structured_output` is `None` and the controller's existing parser
-> returns `TOOL_CALL_MALFORMED`."*
+**Why `RawToolCall` is left alone.** The brief requires both semantics to be
+explicit but permits the wire representations to differ. A proposal is already
+explicit by carrying `tool` and `arguments`. Adding a symmetric tag to
+`RawToolCall` would change every existing proposal payload for no semantic
+gain. `RawToolCall` is unmodified.
 
-> *"Zero calls: the model answered in prose, which is not a proposal."*
+**Why confusion is structurally impossible.** Both types set
+`extra="forbid"`. A payload carrying both a tag and tool fields validates as
+neither: `{"type": "execution_complete", "tool": "x"}` is rejected by
+`ExecutionComplete` for the extra field, and
+`{"tool": "x", "arguments": {}, "type": "execution_complete"}` is rejected by
+`RawToolCall` for the same reason. Ambiguity is refused by the schemas, not by
+a precedence rule someone could later reorder.
 
-> *"Returning `None` is the fail-closed path: the controller's parser then
-> reports `TOOL_CALL_MALFORMED`, the model is asked to try again, and the
-> attempt is charged to the existing budget."*
+**One parser, not two.** `parse_candidate` returns
+`RawToolCall | ExecutionComplete`, dispatching on the presence of the `type`
+key. Architecture rule 10 forbids a second parser beside it, so completion is
+recognised inside the existing boundary rather than in a sibling function. A
+payload carrying `type` with any other value is rejected outright rather than
+falling through to the proposal branch — fail-closed on an unrecognised tag.
 
-`tests/test_model_adapter.py::test_a_response_with_no_tool_call_fails_closed`
-pins it: *"Prose is not a proposal. There is no fallback to narrative."*
+**Absence is unchanged.** `structured_output` that is `None`, empty, or
+unparseable still yields `TOOL_CALL_MALFORMED`. The M9 invariant is untouched
+and its test is unmodified.
 
-Measured end to end: a run whose model answers only in prose makes 3 model
-calls, walks `GENERATE → PARSE → FEEDBACK → RETRY` three times, and terminates
-`failed` with `RETRY_EXHAUSTED`. `TOOL_CALL_MALFORMED` is in `RETRYABLE_CODES`.
+## 5. Execution ceiling — `max_executions`
 
-**So adding `RESPOND → GENERATE` alone does not produce composition — it
-produces a broken run.** E1 would succeed, the controller would ask again, a
-model with nothing further to do would answer in prose, and the run that did
-exactly what was asked would be reported as `RETRY_EXHAUSTED / failed`. This is
-the concrete reason the Phase 1 instruction warned against assuming that edge
-was sufficient.
+**`max_executions` is a run-level composition ceiling, constitutionally
+distinct from `max_attempts`.** They answer different questions and neither is
+derived from, decremented by, or substituted for the other:
 
-Reinterpreting absence as completion would require:
+| | question | scope | default |
+|---|---|---|---|
+| `max_attempts` | how many attempts may *this execution* receive? | execution | 3 |
+| `max_executions` | how many independent executions may *this run* contain? | run | 1 |
 
-* inverting a test whose name ends in `_fails_closed`, which Step 2 forbids;
-* making the same wire value mean "error, retry" at execution 1 and "success,
-  stop" at execution 2 — position-dependent semantics on a security boundary;
-* and, most seriously, making **model silence mean task success**. A truncated
-  response, a transport hiccup yielding empty content, or a prompt injection
-  that suppresses the tool-call channel would all terminate a run as
-  *succeeded* — including a run whose last act was a `MUTATING` execution. That
-  is the exact inverse of the fail-closed-on-ambiguity discipline that
-  Milestone 5's `execution_unknown` and Milestone 9's `unknown ≠ failed`
-  established.
+For `max_executions = N` and `max_attempts = M` the worst case is N × M
+attempts, with each axis retaining independent meaning.
 
-The architecture needs to distinguish *"I have completed the task"* — an
-affirmative statement — from *"I produced nothing"* — an absence. Today it has
-only the second, and it already means something else.
+**Why the default is 1.** It reproduces the pre-M10 contract exactly: a run
+composes one execution unless a deployment asks for more. Composition is
+opt-in, in the same spirit as the three separate registry builders M8 and M9
+established — a stronger capability has to be requested by name.
 
-### The smallest missing contract
+**Ownership.** `RunContext`, alongside `max_attempts`, `max_results_ceiling`
+and the filesystem limits. It is a run-level operational ceiling and that is
+already the structure that owns those; no new subsystem, no manager, no
+scheduler.
 
-Two things are missing. Both are small; neither may be invented unilaterally.
+**The ceiling is checked after parsing and before authorization.** A proposal
+arriving when the ceiling is already consumed is refused at the authority
+boundary, so it never reaches VALIDATE, AUTHORIZE, POLICY_CHECK or the
+executor. The refusal is `POLICY_DENIED`, which is already non-retryable, so
+it consumes no retry budget and does not increment any attempt counter. The run
+terminates failed with an auditable `execution_ceiling_exhausted` event.
 
-**(A) An affirmative completion signal.** The model must be able to say, on a
-channel the controller already trusts, that no further execution is required.
-Two candidate shapes, with the trade-off stated honestly:
+**Why the controller asks even when the ceiling is full.** The alternative —
+stop asking once capacity is gone and terminate successfully — was rejected. It
+would report a run as *complete* when the model may have had further work,
+which conflates "the ceiling was reached" with "the task is finished". Those
+are exactly the kind of two facts this milestone exists to keep apart, and
+reporting truncation as success is the silent-truncation failure the brief
+forbids. So the model is always asked, and a proposal it makes beyond the
+ceiling is refused loudly.
 
-*A1 — a second envelope on the existing structured channel.* The model emits a
-distinct JSON shape (e.g. `{"done": true}`); `parse_candidate` gains one branch
-returning a completion sentinel instead of a `RawToolCall`. No new
-`ModelResponse` field; absence still means malformed, so the fail-closed test
-stands unchanged. Smallest new surface. Depends on model compliance: a model
-that never emits it composes until the §4(B) ceiling stops the run, which is
-safe but is a real limitation.
+## 6. Composition and termination
 
-*A2 — map the wire protocol's own `finish_reason`.* The OpenAI-compatible
-schema carries `choices[].finish_reason` (`"tool_calls"` versus `"stop"`).
-`_ExternalChoice` currently declares only `message`; the adapter never reads
-it. This is the most faithful "the contract already carries this, we simply
-decline to look" option, and the signal is produced by the runtime rather than
-by prompt compliance. **But** Milestone 4's live path remains unobserved — no
-LocalAI instance has ever been reached — so whether the deployed service
-populates `finish_reason` is an assumption, not a measurement. Building the
-composition contract on an unverified wire field would put a load-bearing
-semantic on something no test has seen.
+A run ends in exactly one of these ways, each deterministic:
 
-Recommendation: **A1**, on the grounds that it depends only on machinery the
-deterministic suite already proves end to end, and that A2 can be added later
-as a corroborating signal without changing the controller. This is a
-contract decision and belongs to the project owner, not to this document.
+* **explicit completion** — the model returns `ExecutionComplete`; the run
+  terminates `succeeded`;
+* **ceiling exhausted** — the model proposes when `execution_count >=
+  max_executions`; the run terminates `failed` with `POLICY_DENIED`;
+* **execution failure** — an execution fails non-retryably or exhausts its own
+  `max_attempts`, exactly as before;
+* **operator termination** — `abort` or `terminalize`, unchanged.
 
-**(B) A run-level bound on the number of executions.** With a per-execution
-retry budget and a model-driven continuation signal, nothing bounds how many
-executions a run may compose — a model that proposes forever would compose
-forever. `RunContext` is already the owner of every operational ceiling
-(`max_attempts`, `max_results_ceiling`, `FilesystemLimits`), and
-`records.MAX_OPERATOR_DECISIONS_PER_RUN` is the existing precedent for bounding
-a per-run count that the durable store must also respect. A `max_executions`
-ceiling there is consistent with existing structure rather than a new
-subsystem — but it is still a new authority field, and it is recorded here as
-required rather than added.
+Absence of a proposal remains `TOOL_CALL_MALFORMED`, retried within the current
+execution's budget, terminating `RETRY_EXHAUSTED`. Unchanged from M9.
 
-Note that (B) is required *whichever* form (A) takes, and that it is what
-answers §6 of the Phase 1 question list ("how does it prevent accidental
-infinite generation") without a `while True`.
+## 5b. Step identity
 
-## 5. Step identity — designed, not implemented
+`step_id` becomes `f"{run_id}-s{execution_index}"` where `execution_index` is a
+controller-owned counter incremented once per *authorized execution* — not per
+attempt. A retry of E2 stays within E2's attempt sequence and keeps `-s2`; it
+never becomes E3. The counter derives from nothing external: no wall clock, no
+UUID, no randomness, no model output.
 
-`step_id` is currently `f"{run_context.run_id}-s1"`, a literal. The design is a
-monotonic counter incremented once per *authorized execution*, giving
-`{run_id}-s1`, `-s2`, `-s3`. Deterministic because it derives from a count the
-controller owns, not from a timestamp, a UUID, or model output; and it feeds
-`derive_execution_id`, so two executions of the same capability with identical
-arguments in the same run are already distinct executions by identity.
-
-Resume must continue to take its `step_id` from `_ResumeSeed` rather than
-recomputing it, exactly as it does today, or a resumed execution would acquire
-a new identity and recovery would reject its own journal.
-
-## 6. Termination condition — blocked on §4
-
-A run ends when the model affirmatively signals completion (§4A), when the
-execution ceiling is reached (§4B), when an execution fails non-retryably or
-exhausts its per-execution budget, or when an operator terminates it. The first
-two do not exist yet, which is why this milestone stops here.
+Resume continues to take its `step_id` from `_ResumeSeed`. A resumed execution
+is not a new execution, and assigning it a fresh step id would change its
+execution identity and make recovery reject its own journal.
 
 ## 7. Replay coherence
 

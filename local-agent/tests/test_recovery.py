@@ -28,6 +28,7 @@ from conftest import (
     SimulatedCrash,
     build_fs_tree,
     chat_completion,
+    completion_transport,
     model_config,
     ok,
 )
@@ -64,11 +65,16 @@ def make_controller(
     journal: RunJournal | None,
     executor: Any = None,
     responses: Sequence[Any] | None = None,
+    complete: bool = True,
 ) -> tuple[Controller, Any, ToolRegistry]:
     """A controller over the fake file-search tool and a scripted model."""
     spy = executor if executor is not None else FakeFileSearchExecutor()
     registry = build_default_registry(spy)
-    transport = ScriptedTransport(tuple(responses or (ok(VALID),)))
+    # Milestone 10: a run now ends only when the model affirmatively completes.
+    scripted = tuple(responses or (ok(VALID),))
+    if complete:
+        scripted += (completion_transport(),)
+    transport = ScriptedTransport(scripted)
     adapter = LocalAIModelAdapter(transport, model_config(), describe_tools(registry))
     return Controller(registry, adapter, journal), spy, registry
 
@@ -77,10 +83,11 @@ def run_once(
     journal: RunJournal | None,
     executor: Any = None,
     responses: Sequence[Any] | None = None,
+    complete: bool = True,
 ) -> tuple[RunOutcome, Any, ToolRegistry]:
     import asyncio
 
-    controller, spy, registry = make_controller(journal, executor, responses)
+    controller, spy, registry = make_controller(journal, executor, responses, complete)
     outcome = asyncio.run(
         controller.run(RunContext(run_id=RUN), [{"role": "user", "content": "find notes"}])
     )

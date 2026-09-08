@@ -290,7 +290,7 @@ def test_listing_through_an_outside_symlink_is_denied(fs: FsFixture, fs_spy: Fil
 
 
 def test_broken_symlink_fails_cleanly(fs: FsFixture) -> None:
-    outcome = build_fs_harness(fs, read(path="broken-link")).run()
+    outcome = build_fs_harness(fs, read(path="broken-link"), complete=False).run()
 
     assert outcome.error is not None
     assert outcome.error.code == "EXECUTION_FAILED"
@@ -300,7 +300,7 @@ def test_broken_symlink_fails_cleanly(fs: FsFixture) -> None:
 
 def test_symlink_loop_fails_cleanly_without_leaking_the_path(fs: FsFixture) -> None:
     """CPython 3.11 raises RuntimeError here, whose message embeds the host path."""
-    outcome = build_fs_harness(fs, read(path="loop-a")).run()
+    outcome = build_fs_harness(fs, read(path="loop-a"), complete=False).run()
 
     assert outcome.error is not None
     assert outcome.error.code == "EXECUTION_FAILED"
@@ -316,28 +316,28 @@ def test_symlink_loop_fails_cleanly_without_leaking_the_path(fs: FsFixture) -> N
 
 
 def test_directory_requested_as_a_file_is_rejected(fs: FsFixture) -> None:
-    outcome = build_fs_harness(fs, read(path="src")).run()
+    outcome = build_fs_harness(fs, read(path="src"), complete=False).run()
     assert outcome.error is not None
     assert outcome.error.code == "EXECUTION_FAILED"
     assert reasons(outcome) == ["fs_not_a_regular_file"] * 3
 
 
 def test_file_requested_as_a_directory_is_rejected(fs: FsFixture) -> None:
-    outcome = build_fs_harness(fs, listing(path="README.md")).run()
+    outcome = build_fs_harness(fs, listing(path="README.md"), complete=False).run()
     assert outcome.error is not None
     assert outcome.error.code == "EXECUTION_FAILED"
     assert reasons(outcome) == ["fs_not_a_directory"] * 3
 
 
 def test_descending_through_a_file_is_rejected(fs: FsFixture) -> None:
-    outcome = build_fs_harness(fs, read(path="README.md/child")).run()
+    outcome = build_fs_harness(fs, read(path="README.md/child"), complete=False).run()
     assert outcome.error is not None
     assert outcome.error.code == "EXECUTION_FAILED"
     assert reasons(outcome) == ["fs_not_a_directory"] * 3
 
 
 def test_missing_file_is_rejected(fs: FsFixture) -> None:
-    outcome = build_fs_harness(fs, read(path="does/not/exist.txt")).run()
+    outcome = build_fs_harness(fs, read(path="does/not/exist.txt"), complete=False).run()
     assert outcome.error is not None
     assert outcome.error.code == "EXECUTION_FAILED"
     assert reasons(outcome) == ["fs_not_found"] * 3
@@ -830,7 +830,7 @@ def test_permission_failures_are_normalized(fs: FsFixture) -> None:
 
 def test_non_utf8_content_is_normalized(fs: FsFixture) -> None:
     (fs.workspace / "binary.bin").write_bytes(b"\xff\xfe\x00\x01")
-    outcome = build_fs_harness(fs, read(path="binary.bin")).run()
+    outcome = build_fs_harness(fs, read(path="binary.bin"), complete=False).run()
 
     assert outcome.error is not None
     assert outcome.error.code == "EXECUTION_FAILED"

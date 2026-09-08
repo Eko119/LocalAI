@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
 
 class _Strict(BaseModel):
@@ -312,6 +312,54 @@ class RawToolCall(_Strict):
 
     tool: str
     arguments: dict[str, Any]
+
+
+# The reserved name that means "no further execution is required". It is a
+# *name*, not a tag, for one measured reason: `LocalAIModelAdapter` builds its
+# structured output from `message.tool_calls`, and every path through it emits
+# either `{"tool": ..., "arguments": ...}`, a raw malformed-JSON string, or
+# `None`. There is no path by which a well-formed generation can carry a
+# top-level `type` key, so a tag-shaped completion would have been reachable
+# from the test adapter and unreachable from the production one — a contract
+# that works only in tests. Measured, not assumed.
+#
+# Nothing may be *called* this: `registry.admit` refuses it, so the name can
+# never resolve to a capability and can never reach an executor.
+COMPLETION_TOOL = "execution.complete"
+
+
+class ExecutionComplete(_Strict):
+    """The model's affirmative statement that no further execution is required.
+
+    Milestone 10. This is the *second* shape the structured channel may carry,
+    and it exists because the contract previously had no way to say "done".
+    Absence of a proposal meant `TOOL_CALL_MALFORMED` — by design, by three
+    docstrings in `model_service.py`, and by a named test — so completion had
+    to be stated rather than inferred. Making silence mean success would have
+    turned a truncated response or a suppressed tool-call channel into a
+    successfully completed run, inverting the fail-closed discipline every
+    earlier milestone established.
+
+    **Why this cannot be confused with a proposal.** The name is reserved and
+    inadmissible, so no capability bears it and the parser routes it here
+    before a `RawToolCall` is ever constructed. `arguments` must be empty:
+    completion carries no payload, and a completion with arguments is a
+    malformed completion rather than a proposal in disguise.
+    """
+
+    tool: Literal["execution.complete"]
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("arguments")
+    @classmethod
+    def _no_arguments(cls, value: dict[str, Any]) -> dict[str, Any]:
+        # Strict rather than tolerant: silently ignoring a payload here would
+        # give the model a channel the controller does not read, and every
+        # other boundary in this package refuses those rather than dropping
+        # them.
+        if value:
+            raise ValueError("execution.complete takes no arguments")
+        return value
 
 
 class ModelRequest(_Strict):

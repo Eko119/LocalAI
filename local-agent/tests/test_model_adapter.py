@@ -113,7 +113,7 @@ def test_the_request_goes_to_the_chat_completions_endpoint() -> None:
 def test_transport_failures_normalize_to_existing_error_codes(
     outcome: BaseException, code: str, reason: str
 ) -> None:
-    harness = build_model_harness(outcome)
+    harness = build_model_harness(outcome, complete=False)
     result = harness.run()
 
     assert result.error is not None
@@ -125,7 +125,9 @@ def test_transport_failures_normalize_to_existing_error_codes(
 
 def test_the_adapter_never_retries_on_its_own() -> None:
     """Three controller attempts must mean exactly three transport calls."""
-    harness = build_model_harness(ModelTransportError("model_transport_unreachable"))
+    harness = build_model_harness(
+        ModelTransportError("model_transport_unreachable"), complete=False
+    )
     outcome = harness.run()
 
     assert harness.transport.call_count == 3
@@ -137,6 +139,7 @@ def test_a_custom_budget_still_bounds_transport_calls() -> None:
     harness = build_model_harness(
         ModelTransportError("model_transport_unreachable"),
         run_context=RunContext(run_id="r", max_attempts=5),
+        complete=False,
     )
     harness.run()
     assert harness.transport.call_count == 5
@@ -160,7 +163,7 @@ def test_a_custom_budget_still_bounds_transport_calls() -> None:
     ],
 )
 def test_malformed_service_responses_are_normalized(body: bytes, reason: str) -> None:
-    harness = build_model_harness(ok(body))
+    harness = build_model_harness(ok(body), complete=False)
     outcome = harness.run()
 
     assert outcome.error is not None
@@ -302,6 +305,7 @@ def test_an_oversized_structured_output_fails_closed() -> None:
             )
         ),
         config=model_config(max_structured_output_bytes=100),
+        complete=False,
     )
     outcome = harness.run()
 
@@ -466,7 +470,7 @@ def test_the_request_carries_no_credential() -> None:
 def test_the_request_carries_no_retry_budget_or_policy_internals() -> None:
     """A rejected first attempt still must not transmit budget internals."""
     harness = build_model_harness(
-        [ok(chat_completion(tool="file_search", raw_arguments="bad json")), ok(VALID)]
+        [ok(chat_completion(tool="file_search", raw_arguments="bad json")), ok(VALID)],
     )
     outcome = harness.run()
     assert outcome.succeeded
@@ -566,7 +570,7 @@ def test_a_recoverable_failure_then_success() -> None:
 
 def test_two_failures_then_success_on_the_third_attempt() -> None:
     harness = build_model_harness(
-        [ModelTransportTimeout("model_transport_timeout"), ok(b"not json"), ok(VALID)]
+        [ModelTransportTimeout("model_transport_timeout"), ok(b"not json"), ok(VALID)],
     )
     outcome = harness.run()
 
@@ -576,7 +580,7 @@ def test_two_failures_then_success_on_the_third_attempt() -> None:
 
 
 def test_failing_forever_terminates_at_the_budget() -> None:
-    harness = build_model_harness(ModelTransportTimeout("model_transport_timeout"))
+    harness = build_model_harness(ModelTransportTimeout("model_transport_timeout"), complete=False)
     outcome = harness.run()
 
     assert outcome.terminal.model_dump() == {
@@ -590,7 +594,7 @@ def test_failing_forever_terminates_at_the_budget() -> None:
 
 def test_an_identical_repeated_response_still_consumes_the_budget() -> None:
     harness = build_model_harness(
-        ok(chat_completion(tool="file_search", arguments={"root_id": "workspace"}))
+        ok(chat_completion(tool="file_search", arguments={"root_id": "workspace"})), complete=False
     )
     outcome = harness.run()
 
@@ -803,7 +807,7 @@ def test_a_failing_attempt_never_substitutes_a_different_model() -> None:
             ModelTransportError("model_service_status_401"),
             ModelTransportError("model_service_status_404"),
             ok(VALID),
-        ]
+        ],
     )
     outcome = harness.run()
 

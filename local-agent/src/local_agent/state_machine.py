@@ -53,17 +53,32 @@ class State(Enum):
 # FEEDBACK, which then either loops back to GENERATE via RETRY (budget
 # remaining) or ends the run at TERMINAL (exhausted or non-retryable).
 # TERMINAL has no outgoing edges: once entered, a run is over.
+#
+# Milestone 10 adds exactly two edges, and only two:
+#
+#   RESPOND -> GENERATE   a successful execution may be followed by another,
+#                         when the model asks for one and the run's
+#                         `max_executions` ceiling still has capacity. This is
+#                         NOT unconditional: the controller asks, and the
+#                         model's next answer decides which branch is taken.
+#   PARSE   -> TERMINAL   the model answered with `ExecutionComplete` — an
+#                         affirmative "no further execution is required".
+#                         Absence of a proposal is still TOOL_CALL_MALFORMED
+#                         and still routes to FEEDBACK, unchanged.
+#
+# Together they turn the attempt loop into an attempt loop nested inside an
+# execution loop, without a second state machine to manage the sequence.
 TRANSITIONS: dict[State, frozenset[State]] = {
     State.RECEIVE: frozenset({State.CLASSIFY}),
     State.CLASSIFY: frozenset({State.GENERATE}),
     State.GENERATE: frozenset({State.PARSE, State.FEEDBACK}),
-    State.PARSE: frozenset({State.VALIDATE, State.FEEDBACK}),
+    State.PARSE: frozenset({State.VALIDATE, State.FEEDBACK, State.TERMINAL}),
     State.VALIDATE: frozenset({State.AUTHORIZE, State.FEEDBACK}),
     State.AUTHORIZE: frozenset({State.POLICY_CHECK, State.FEEDBACK}),
     State.POLICY_CHECK: frozenset({State.EXECUTE, State.FEEDBACK}),
     State.EXECUTE: frozenset({State.VERIFY, State.FEEDBACK}),
     State.VERIFY: frozenset({State.RESPOND, State.FEEDBACK}),
-    State.RESPOND: frozenset({State.TERMINAL}),
+    State.RESPOND: frozenset({State.TERMINAL, State.GENERATE}),
     State.FEEDBACK: frozenset({State.RETRY, State.TERMINAL}),
     State.RETRY: frozenset({State.GENERATE}),
     State.TERMINAL: frozenset(),

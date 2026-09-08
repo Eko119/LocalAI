@@ -120,7 +120,20 @@ class RunContext:
     """
 
     run_id: str
+    # How many attempts one EXECUTION may receive. Execution-scoped: it bounds
+    # the repair loop for a single proposal, and it is reset for each new
+    # execution a run composes.
     max_attempts: int = 3
+    # Milestone 10. How many independent EXECUTIONS this run may contain.
+    # Run-scoped, and constitutionally distinct from `max_attempts`: neither is
+    # derived from, decremented by, or substituted for the other. For
+    # `max_executions = N` and `max_attempts = M` the worst case is N x M
+    # attempts, with each axis retaining independent meaning.
+    #
+    # The default of 1 reproduces the pre-M10 contract exactly — a run composes
+    # one execution unless a deployment asks for more. Composition is opt-in,
+    # in the same spirit as the separate registry builders M8 and M9 added.
+    max_executions: int = 1
     authorized_tools: frozenset[str] = field(default_factory=lambda: frozenset({"file_search"}))
     authorized_roots: frozenset[str] = field(default_factory=lambda: frozenset(LEGAL_ROOT_IDS))
     allow_destructive: bool = False
@@ -135,6 +148,12 @@ class RunContext:
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
+        # Validated separately from `max_attempts`, and never against it. A
+        # run with one execution and three attempts is as legitimate as one
+        # with three executions and one attempt; the two numbers do not
+        # constrain each other in either direction.
+        if self.max_executions < 1:
+            raise ValueError("max_executions must be >= 1")
         illegal = self.authorized_roots - LEGAL_ROOT_IDS
         if illegal:
             raise ValueError(f"authorized_roots contains non-existent roots: {sorted(illegal)}")

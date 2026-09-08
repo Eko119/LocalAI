@@ -838,7 +838,9 @@ def test_a_pre_execution_failure_never_writes_and_still_retries(
     write_tree: WriteFixture,
 ) -> None:
     """Nothing ran, so the capability contract has no say over the repair loop."""
-    harness = build_write_harness(write_tree, ModelResponse(structured_output="{not json"))
+    harness = build_write_harness(
+        write_tree, ModelResponse(structured_output="{not json"), complete=False
+    )
     outcome = harness.run()
 
     assert harness.writes == 0

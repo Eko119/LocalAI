@@ -43,6 +43,24 @@ EventType = Literal[
     # Milestone 8: the write-ahead record could not be persisted, so the
     # attempt was refused before the executor rather than crashing the run.
     "authorization_not_persistable",
+    # Milestone 10: composition. Structural facts only, as everywhere else —
+    # a step id, two counts and a ceiling. Never a payload, never model text.
+    #
+    # `execution_finished` marks one execution's boundary, which is what makes
+    # a composed run auditable as a sequence rather than as one blur.
+    "execution_finished",
+    # The model affirmatively declared that no further execution is required.
+    # Distinct from any failure code: this is a success path, and it exists so
+    # that completion is never inferred from absence.
+    "execution_complete_declared",
+    # A further execution was requested with the run's composition ceiling
+    # already consumed. Refused before authorization, so nothing reached the
+    # executor, and non-retryable, so no attempt counter moved.
+    "execution_ceiling_exhausted",
+    # A completion arrived while a rejection was outstanding. Refused: the
+    # model was asked to repair a proposal, and "I am finished" is not a
+    # repair. Without this a refusal could be laundered into a success.
+    "completion_rejected_during_repair",
     # Milestone 6: the operator control plane. Structural facts only, as
     # everywhere else — an action name, a plan id, a sequence, a stable reason
     # code. Never an operator identity, never free text.

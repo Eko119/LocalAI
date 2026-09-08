@@ -182,6 +182,18 @@ class RunStarted(_Record):
     schema_version: int = SCHEMA_VERSION
     run_id: str = Field(pattern=RUN_ID_PATTERN)
     max_attempts: int = Field(ge=1, le=100)
+    # Milestone 10. Persisted for the same reason `max_attempts` is: recovery
+    # re-validates the run's authority against the live `RunContext` and must
+    # be able to see the composition ceiling the run was actually started
+    # under. Without it a recovered run could compose past a ceiling that had
+    # since been narrowed, which is the "take a budget from the file" mistake
+    # in reverse — the file does not grant the ceiling, it is checked against
+    # the live one, and disagreement is fatal.
+    #
+    # Defaulted to 1 so a journal written before this field existed still
+    # parses, and 1 is also the live default, so such a journal validates
+    # rather than failing spuriously.
+    max_executions: int = Field(default=1, ge=1, le=1000)
 
 
 class ExecutionAuthorized(_Record):

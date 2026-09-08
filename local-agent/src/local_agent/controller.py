@@ -26,10 +26,12 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from .contracts import (
+    COMPLETION_TOOL,
     RETRYABLE_CODES,
     ControllerError,
     ControllerTerminal,
     ErrorCode,
+    ExecutionComplete,
     ModelRequest,
     ModelResponse,
     RawToolCall,
@@ -102,7 +104,7 @@ class _Rejection(Exception):
         super().__init__(message)
 
 
-def parse_candidate(response: ModelResponse) -> RawToolCall:
+def parse_candidate(response: ModelResponse) -> RawToolCall | ExecutionComplete:
     """The parser boundary (spec §"reasoning_boundary", 08 Correction 4).
 
     Only `response.structured_output` is eligible. `reasoning` and `narrative`
@@ -126,6 +128,25 @@ def parse_candidate(response: ModelResponse) -> RawToolCall:
         # Also the answer to "multiple competing tool calls": a JSON array of
         # calls is not a single envelope, so it never becomes a candidate.
         raise _Rejection("TOOL_CALL_MALFORMED", _MALFORMED_MESSAGE)
+
+    if payload.get("tool") == COMPLETION_TOOL:
+        # Milestone 10. The structured channel now carries two shapes, and the
+        # discriminator is a reserved capability name — the only discriminator
+        # the production adapter can actually emit, since it builds its output
+        # from `message.tool_calls`.
+        #
+        # Routed here *before* a `RawToolCall` is constructed, so a completion
+        # never becomes a proposal. Nothing can be called this: `registry.admit`
+        # refuses the name, so it can never resolve to a capability, and a
+        # completion carrying arguments is refused as malformed rather than
+        # treated as a call.
+        #
+        # This is one parser, not two. Architecture rule 10 forbids a second
+        # parser beside this function.
+        try:
+            return ExecutionComplete.model_validate(payload)
+        except ValidationError as exc:
+            raise _Rejection("TOOL_CALL_MALFORMED", _MALFORMED_MESSAGE) from exc
 
     try:
         return RawToolCall.model_validate(payload)
@@ -219,6 +240,9 @@ class RunOutcome:
     attempts: int
     result: BaseModel | None = None
     error: ControllerError | None = None
+    # Milestone 10: how many executions this run actually composed. Distinct
+    # from `attempts`, which counts tries at the final execution.
+    executions: int = 0
 
     @property
     def succeeded(self) -> bool:
@@ -249,7 +273,13 @@ class Controller:
         recorder = EventRecorder(run_context.run_id)
         machine = Run()
         recorder.record("run_created", max_attempts=run_context.max_attempts)
-        self._persist(RunStarted(run_id=run_context.run_id, max_attempts=run_context.max_attempts))
+        self._persist(
+            RunStarted(
+                run_id=run_context.run_id,
+                max_attempts=run_context.max_attempts,
+                max_executions=run_context.max_executions,
+            )
+        )
         recorder.record("state_entered", state=State.RECEIVE.value)
 
         self._enter(machine, recorder, State.CLASSIFY)
@@ -275,10 +305,26 @@ class Controller:
         recovery-specific execution path, and that is deliberate: a second path
         would be a second place for a gate to be forgotten.
         """
+        # COMPOSITION STATE (Milestone 10). `execution_index` counts authorized
+        # executions, not attempts: a retry of E2 stays inside E2's attempt
+        # sequence and keeps `-s2`. The counter is controller-owned and derives
+        # from nothing external — no clock, no UUID, no model output — which is
+        # what makes step identity deterministic across repetitions.
+        execution_index = 1
         step_id = seed.step_id if seed is not None else f"{run_context.run_id}-s1"
         attempt = seed.attempt if seed is not None else 1
         feedback: ToolFeedback | None = None
         last_error: ControllerError | None = None
+        # A resumed run finishes the execution it was resumed for and stops.
+        # Milestone 6 established that a successful resume terminates through
+        # RESPOND -> TERMINAL and explicitly deferred "manufacture another model
+        # generation after recovery"; composing further would do exactly that,
+        # against a run the model never saw. Recorded as deferred, not silently
+        # changed.
+        resumed_run = seed is not None
+        executions_completed = 0
+        last_result: BaseModel | None = None
+        last_execution_attempts = 1
 
         while True:
             tool_call_id = f"{step_id}-a{attempt}"
@@ -339,6 +385,104 @@ class Controller:
 
                     self._enter(machine, recorder, State.PARSE)
                     candidate = parse_candidate(response)
+
+                    if isinstance(candidate, ExecutionComplete) and feedback is not None:
+                        # COMPLETION IS NOT A REPAIR.
+                        #
+                        # The controller asks two different questions and the
+                        # valid answers differ. After a rejection it asks
+                        # "repair this proposal"; after a successful execution
+                        # it asks "anything else?". Only the second admits a
+                        # completion.
+                        #
+                        # Without this the model could launder a refusal into a
+                        # success: told its proposal was denied, it answers
+                        # "complete" and the run reports `succeeded`. That is
+                        # the model deciding a run's outcome, which is the one
+                        # thing every gate in this pipeline exists to prevent.
+                        #
+                        # The run therefore ends on the error that was actually
+                        # outstanding, not on a new one about the completion.
+                        # The failure is the proposal nobody repaired; saying
+                        # "I am finished" did not create a second, different
+                        # problem, and reporting one would bury the real cause.
+                        assert last_error is not None  # feedback implies a prior rejection
+                        recorder.record("completion_rejected_during_repair", attempt=attempt)
+                        self._enter(machine, recorder, State.FEEDBACK)
+                        self._enter(machine, recorder, State.TERMINAL)
+                        recorder.record(
+                            "terminal", status="failed", code=last_error.code, attempts=attempt
+                        )
+                        self._persist(
+                            RunTerminal(
+                                run_id=run_context.run_id,
+                                status="failed",
+                                code=last_error.code,
+                                attempts=attempt,
+                            )
+                        )
+                        return RunOutcome(
+                            terminal=ControllerTerminal(
+                                status="failed", code=last_error.code, attempts=attempt
+                            ),
+                            states=tuple(machine.history),
+                            events=recorder.snapshot(),
+                            attempts=attempt,
+                            error=last_error,
+                            executions=executions_completed,
+                        )
+
+                    if isinstance(candidate, ExecutionComplete):
+                        # CASE B: affirmative completion at a composition
+                        # boundary. The model stated that no further execution
+                        # is required, so the run ends successfully. It requires
+                        # a positive statement — absence still lands in the
+                        # malformed branch, unchanged.
+                        recorder.record(
+                            "execution_complete_declared",
+                            executions=executions_completed,
+                            attempt=attempt,
+                        )
+                        self._enter(machine, recorder, State.TERMINAL)
+                        recorder.record(
+                            "terminal", status="succeeded", attempts=last_execution_attempts
+                        )
+                        self._persist(
+                            RunTerminal(
+                                run_id=run_context.run_id,
+                                status="succeeded",
+                                attempts=last_execution_attempts,
+                            )
+                        )
+                        return RunOutcome(
+                            terminal=ControllerTerminal(
+                                status="succeeded", code=None, attempts=last_execution_attempts
+                            ),
+                            states=tuple(machine.history),
+                            events=recorder.snapshot(),
+                            attempts=last_execution_attempts,
+                            result=last_result,
+                            executions=executions_completed,
+                        )
+
+                    if execution_index > run_context.max_executions:
+                        # CASE C: a further execution was requested and the
+                        # run's composition ceiling is already consumed.
+                        #
+                        # Checked HERE — after parsing, before VALIDATE,
+                        # AUTHORIZE, POLICY_CHECK and the executor — so a
+                        # request for execution N+1 never reaches any of them.
+                        # `POLICY_DENIED` is not in `RETRYABLE_CODES`, so this
+                        # consumes no retry budget and increments no attempt
+                        # counter: the ceiling is not a failure of *this*
+                        # execution, it is the run's capacity running out.
+                        recorder.record(
+                            "execution_ceiling_exhausted",
+                            requested=execution_index,
+                            max_executions=run_context.max_executions,
+                        )
+                        raise _Rejection("POLICY_DENIED", _DENIED_MESSAGE)
+
                     tool_name = candidate.tool
                     recorder.record("candidate_parsed", tool=tool_name, attempt=attempt)
 
@@ -491,6 +635,35 @@ class Controller:
                 )
 
             self._enter(machine, recorder, State.RESPOND)
+            executions_completed += 1
+            last_result = result
+            last_execution_attempts = attempt
+            recorder.record("execution_finished", step=step_id, executions=executions_completed)
+
+            if not resumed_run:
+                # COMPOSITION BOUNDARY (Milestone 10). One execution has
+                # finished; ask whether another is wanted. The controller does
+                # NOT decide here that the run is over, and it does not decide
+                # that another execution happens either — it asks, and the
+                # model's next answer takes one of the three branches at PARSE:
+                # a proposal (continue), an `ExecutionComplete` (terminate
+                # successfully), or anything else (the unchanged fail-closed
+                # path).
+                #
+                # The ceiling is deliberately NOT consulted here. Stopping
+                # early because capacity is gone would report a truncated run
+                # as complete, conflating "the ceiling was reached" with "the
+                # task is finished" — the silent truncation this milestone
+                # exists to prevent. So the question is always asked, and a
+                # proposal beyond the ceiling is refused loudly above.
+                execution_index += 1
+                step_id = f"{run_context.run_id}-s{execution_index}"
+                attempt = 1
+                feedback = None
+                self._enter(machine, recorder, State.GENERATE)
+                continue
+
+            # A resumed run stops here, preserving the Milestone 6 contract.
             self._enter(machine, recorder, State.TERMINAL)
             recorder.record("terminal", status="succeeded", attempts=attempt)
             self._persist(
@@ -502,6 +675,7 @@ class Controller:
                 events=recorder.snapshot(),
                 attempts=attempt,
                 result=result,
+                executions=executions_completed,
             )
 
     # -- individual gates -------------------------------------------------

@@ -18,7 +18,12 @@ from typing import Any
 
 import pytest
 
-from local_agent.contracts import FileSearchArgs, FileSearchResult, ModelResponse
+from local_agent.contracts import (
+    COMPLETION_TOOL,
+    FileSearchArgs,
+    FileSearchResult,
+    ModelResponse,
+)
 from local_agent.controller import Controller, RunOutcome
 from local_agent.executors.file_search import FakeFileSearchExecutor, build_file_search_spec
 from local_agent.executors.workspace_fs import (
@@ -40,6 +45,34 @@ from local_agent.wiring import (
     build_physical_roots,
     describe_tools,
 )
+
+# Milestone 10. The structured channel now carries two shapes, and a run ends
+# only when the model affirmatively says it is finished. Absence of a proposal
+# is still `TOOL_CALL_MALFORMED` — that invariant is unchanged and its test is
+# untouched — so every harness that drives a run to success has to supply a
+# completion response.
+#
+# Appending it here rather than in ~100 individual tests keeps those tests
+# asserting exactly what they always asserted. It is safe for the retry and
+# failure suites too: `ScriptedModelAdapter` returns responses in order, and a
+# run that exhausts its budget on a bad proposal never reaches this entry.
+COMPLETION_RESPONSE = ModelResponse(
+    structured_output=json.dumps({"tool": "execution.complete", "arguments": {}})
+)
+
+
+def _with_completion(
+    responses: Sequence[ModelResponse], complete: bool = True
+) -> tuple[ModelResponse, ...]:
+    """Script `responses`, then an affirmative completion unless opted out.
+
+    `complete=False` is for tests whose run is *meant* to fail on a retryable
+    error. There the model is asked again while a rejection is outstanding, and
+    a completion offered at that point is refused as "not a repair" — correct
+    behaviour, but it changes which error the run finally reports, so those
+    tests script their own repetition instead.
+    """
+    return tuple(responses) + ((COMPLETION_RESPONSE,) if complete else ())
 
 
 def tool_call_json(tool: str = "file_search", **arguments: Any) -> str:
@@ -77,6 +110,7 @@ def build_harness(
     responses: Sequence[ModelResponse] | ModelResponse,
     run_context: RunContext | None = None,
     executor: Any = None,
+    complete: bool = True,
 ) -> Harness:
     """Wire a controller around a scripted model and a spying executor.
 
@@ -87,7 +121,7 @@ def build_harness(
     if isinstance(responses, ModelResponse):
         responses = (responses,)
     executor = executor if executor is not None else FakeFileSearchExecutor()
-    adapter = ScriptedModelAdapter(tuple(responses))
+    adapter = ScriptedModelAdapter(_with_completion(responses, complete))
     controller = Controller(build_default_registry(executor), adapter)
     return Harness(
         executor=executor,
@@ -255,13 +289,14 @@ def build_fs_harness(
     responses: Sequence[ModelResponse] | ModelResponse,
     run_context: RunContext | None = None,
     limits: FilesystemLimits = DEFAULT_FILESYSTEM_LIMITS,
+    complete: bool = True,
 ) -> FsHarness:
     """Wire the production filesystem registry, keeping both executors as spies."""
     if isinstance(responses, ModelResponse):
         responses = (responses,)
     read_executor = WorkspaceReadExecutor(fixture.roots, limits)
     list_executor = WorkspaceListExecutor(fixture.roots, limits)
-    adapter = ScriptedModelAdapter(tuple(responses))
+    adapter = ScriptedModelAdapter(_with_completion(responses, complete))
     controller = Controller(
         build_filesystem_registry(
             fixture.roots,
@@ -407,17 +442,37 @@ class ModelHarness:
         )
 
 
+def completion_transport() -> TransportResponse:
+    """A LocalAI-shaped body carrying the reserved completion tool call.
+
+    For helpers that script a `ScriptedTransport` rather than a
+    `ScriptedModelAdapter`. Being expressible here is the point: the completion
+    contract has to be reachable through the production adapter, not only from
+    the test double.
+    """
+    return ok(chat_completion(tool=COMPLETION_TOOL, arguments={}))
+
+
 def build_model_harness(
     outcomes: Sequence[TransportResponse | BaseException] | TransportResponse | BaseException,
     config: ModelServiceConfig | None = None,
     run_context: RunContext | None = None,
+    complete: bool = True,
 ) -> ModelHarness:
     if isinstance(outcomes, TransportResponse | BaseException):
         outcomes = (outcomes,)
     resolved = config or model_config()
     executor = FakeFileSearchExecutor()
     registry = build_default_registry(executor)
-    transport = ScriptedTransport(tuple(outcomes))
+    # The completion has to be scripted at the *transport* here, not as a
+    # `ModelResponse`: this harness drives the production adapter, so the run
+    # only ends when a real LocalAI-shaped body carries the reserved tool call.
+    # That is also the proof the completion contract is reachable in
+    # production rather than only from the test adapter.
+    scripted = tuple(outcomes) + (
+        (ok(chat_completion(tool=COMPLETION_TOOL, arguments={})),) if complete else ()
+    )
+    transport = ScriptedTransport(scripted)
     adapter = LocalAIModelAdapter(
         transport=transport, config=resolved, tools=describe_tools(registry)
     )
@@ -880,6 +935,7 @@ def build_write_harness(
     executor: Any = None,
     journal: Any = None,
     run_id: str = "run-write",
+    complete: bool = True,
 ) -> WriteHarness:
     """Wire the production writable registry, keeping the writer as a spy."""
     from local_agent.executors.workspace_write import WorkspaceWriteExecutor
@@ -888,7 +944,7 @@ def build_write_harness(
     if isinstance(responses, ModelResponse):
         responses = (responses,)
     write_executor = executor or WorkspaceWriteExecutor(fixture.roots, limits)
-    adapter = ScriptedModelAdapter(tuple(responses))
+    adapter = ScriptedModelAdapter(_with_completion(responses, complete))
     registry = build_writable_filesystem_registry(
         fixture.roots, limits, write_executor=write_executor
     )
@@ -977,6 +1033,7 @@ def build_append_harness(
     executor: Any = None,
     journal: Any = None,
     run_id: str = "run-append",
+    complete: bool = True,
 ) -> AppendHarness:
     """Wire the production mutating registry, keeping the appender as a spy."""
     from local_agent.executors.workspace_append import WorkspaceAppendExecutor
@@ -985,7 +1042,7 @@ def build_append_harness(
     if isinstance(responses, ModelResponse):
         responses = (responses,)
     append_executor = executor or WorkspaceAppendExecutor(fixture.roots, limits)
-    adapter = ScriptedModelAdapter(tuple(responses))
+    adapter = ScriptedModelAdapter(_with_completion(responses, complete))
     registry = build_mutating_filesystem_registry(
         fixture.roots, limits, append_executor=append_executor
     )

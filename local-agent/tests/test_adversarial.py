@@ -58,6 +58,12 @@ def test_case_01_valid_tool_call_executes() -> None:
         State.EXECUTE,
         State.VERIFY,
         State.RESPOND,
+        # Milestone 10: a successful execution is followed by asking whether
+        # another is wanted. The model answered with an affirmative completion,
+        # which is parsed and ends the run — so the shape gains one more
+        # GENERATE/PARSE pair rather than terminating straight from RESPOND.
+        State.GENERATE,
+        State.PARSE,
         State.TERMINAL,
     ]
 
@@ -89,7 +95,7 @@ def test_case_01_valid_tool_call_executes() -> None:
 def test_cases_02_to_06_schema_violations_never_execute(
     label: str, arguments: dict[str, object], expected_field: str
 ) -> None:
-    harness = build_harness(_resp(call_with_arguments(arguments)))
+    harness = build_harness(_resp(call_with_arguments(arguments)), complete=False)
     outcome = harness.run()
 
     assert outcome.error is not None
@@ -310,7 +316,7 @@ def test_case_14_timeout_normalizes_and_the_run_can_recover() -> None:
 
 
 def test_case_14b_repeated_timeouts_terminate_within_budget() -> None:
-    harness = build_harness(_resp(valid_call(query="timeout_trigger")))
+    harness = build_harness(_resp(valid_call(query="timeout_trigger")), complete=False)
     outcome = harness.run()
 
     assert outcome.terminal.code == "RETRY_EXHAUSTED"
@@ -324,7 +330,9 @@ def test_case_14b_repeated_timeouts_terminate_within_budget() -> None:
 
 def test_case_15_identical_invalid_proposals_consume_the_budget() -> None:
     """The same bad call forever must not become an infinite loop."""
-    harness = build_harness(_resp(tool_call_json(root_id="workspace")))  # missing query
+    harness = build_harness(
+        _resp(tool_call_json(root_id="workspace")), complete=False
+    )  # missing query
     outcome = harness.run()
 
     assert harness.adapter.call_count == 3
@@ -341,7 +349,7 @@ def test_case_15_identical_invalid_proposals_consume_the_budget() -> None:
 
 
 def test_case_16_retry_exhaustion_emits_the_specified_terminal_payload() -> None:
-    harness = build_harness(_resp(tool_call_json(root_id="workspace")))
+    harness = build_harness(_resp(tool_call_json(root_id="workspace")), complete=False)
     outcome = harness.run()
 
     assert outcome.terminal.model_dump() == {
@@ -399,7 +407,7 @@ def test_case_18_corrupt_results_verify_as_failures_without_crashing(
     payload: object,
 ) -> None:
     executor = CorruptResultExecutor(payload)
-    harness = build_harness(_resp(valid_call()), executor=executor)
+    harness = build_harness(_resp(valid_call()), executor=executor, complete=False)
 
     outcome = harness.run()  # must not raise
 
@@ -502,7 +510,7 @@ def test_case_20c_persistent_tampering_still_terminates_at_three_attempts() -> N
             "max_attempts": 10_000,
         }
     )
-    harness = build_harness(_resp(payload))
+    harness = build_harness(_resp(payload), complete=False)
     outcome = harness.run()
 
     assert harness.adapter.call_count == 3

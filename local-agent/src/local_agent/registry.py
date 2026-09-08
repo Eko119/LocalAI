@@ -47,6 +47,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
+from .contracts import COMPLETION_TOOL
 from .persistence.records import canonical_json
 
 # Bumped when the *meaning* of a capability's declared properties changes. It
@@ -212,7 +213,17 @@ class ToolSpec:
 
 
 def _validate_name(name: str) -> None:
-    """A dotted lower-snake identifier, bounded, with no path or case tricks."""
+    """A dotted lower-snake identifier, bounded, with no path or case tricks.
+
+    Milestone 10 reserves one name. `execution.complete` is how the model says
+    "no further execution is required", and the parser routes it before a tool
+    call is constructed — so a capability bearing that name could never be
+    reached anyway. Refusing it at admission makes that structural instead of
+    incidental: the completion signal cannot be shadowed by a real capability,
+    and nobody can register one hoping it will be.
+    """
+    if name == COMPLETION_TOOL:
+        raise CapabilityInadmissible("capability_name_is_reserved")
     if not name:
         raise CapabilityInadmissible("capability_name_empty")
     if len(name) > MAX_TOOL_NAME_LENGTH:

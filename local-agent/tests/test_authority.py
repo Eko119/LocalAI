@@ -88,7 +88,8 @@ def test_llm_cannot_increase_retry_limits() -> None:
                     "arguments": {"query": "a", "root_id": "workspace", "max_attempts": 99},
                 }
             )
-        )
+        ),
+        complete=False,
     )
     outcome = harness.run()
 
