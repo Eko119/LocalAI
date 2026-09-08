@@ -932,6 +932,134 @@ class WriteThenFailExecutor:
         raise ToolExecutionError("downstream hiccup after the write landed")
 
 
+def append_proposal(path: str, content: str, root_id: str = "workspace") -> str:
+    return json.dumps(
+        {
+            "tool": "workspace.append",
+            "arguments": {"root_id": root_id, "path": path, "content": content},
+        }
+    )
+
+
+@dataclass
+class AppendHarness:
+    """A controller wired to the production appender over an isolated tree.
+
+    Deliberately the same shape as `WriteHarness`, because the two capabilities
+    differ in classification rather than in plumbing — and a test that compares
+    a `MUTATING` retry count against an `IDEMPOTENT` one is only meaningful if
+    everything except the capability is held constant.
+    """
+
+    fixture: WriteFixture
+    executor: Any
+    adapter: ScriptedModelAdapter
+    controller: Controller
+    run_context: RunContext
+    journal: Any = None
+
+    @property
+    def appends(self) -> int:
+        """Physical appends. The irreversible count, not the dispatch count."""
+        return int(self.executor.append_count)
+
+    def run(self) -> RunOutcome:
+        return asyncio.run(
+            self.controller.run(self.run_context, [{"role": "user", "content": "append it"}])
+        )
+
+
+def build_append_harness(
+    fixture: WriteFixture,
+    responses: Sequence[ModelResponse] | ModelResponse,
+    run_context: RunContext | None = None,
+    limits: FilesystemLimits = DEFAULT_FILESYSTEM_LIMITS,
+    executor: Any = None,
+    journal: Any = None,
+    run_id: str = "run-append",
+) -> AppendHarness:
+    """Wire the production mutating registry, keeping the appender as a spy."""
+    from local_agent.executors.workspace_append import WorkspaceAppendExecutor
+    from local_agent.wiring import build_mutating_filesystem_registry, build_mutating_run_context
+
+    if isinstance(responses, ModelResponse):
+        responses = (responses,)
+    append_executor = executor or WorkspaceAppendExecutor(fixture.roots, limits)
+    adapter = ScriptedModelAdapter(tuple(responses))
+    registry = build_mutating_filesystem_registry(
+        fixture.roots, limits, append_executor=append_executor
+    )
+    return AppendHarness(
+        fixture=fixture,
+        executor=append_executor,
+        adapter=adapter,
+        controller=Controller(registry, adapter, journal=journal),
+        run_context=run_context or build_mutating_run_context(run_id, limits=limits),
+        journal=journal,
+    )
+
+
+class AppendThenFailExecutor:
+    """Performs a real, measurable append and then raises a retryable error.
+
+    The Milestone 9 counterpart of `WriteThenFailExecutor`, and the instrument
+    the central retry proof depends on. The physical effect genuinely happens
+    before the failure, so counting `appends` after the run answers the
+    question the milestone exists to ask: with a budget of three and a
+    retryable error, how many irreversible acts did the controller authorize?
+
+    For `IDEMPOTENT` the answer is three and that is correct. For `MUTATING` it
+    must be one.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.calls: list[Any] = []
+        self.appends: list[Any] = []
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    @property
+    def append_count(self) -> int:
+        return len(self.appends)
+
+    def execute(self, args: Any) -> Any:
+        from local_agent.registry import ToolExecutionError
+
+        self.calls.append(args)
+        self._inner.execute(args)  # the physical effect really happens
+        self.appends.append(args)
+        raise ToolExecutionError("downstream hiccup after the append landed")
+
+
+class CrashAfterAppendExecutor(RecordingExecutor):
+    """Appends for real, then dies before the controller learns it happened.
+
+    This is the Milestone 9 state made physical: bytes are in the file, no
+    completion evidence exists, and — because the capability is not
+    re-executable — nothing may repeat it automatically. Every other crash
+    executor in this file produces an ambiguity that is either harmless or
+    repairable by repetition. This one produces neither.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        super().__init__()
+        self._inner = inner
+        self.appends: list[Any] = []
+
+    @property
+    def append_count(self) -> int:
+        return len(self.appends)
+
+    def execute(self, args: Any) -> Any:
+        self.calls.append(args)
+        self._inner.execute(args)
+        self.appends.append(args)
+        raise SimulatedCrash("during:append_completion")
+
+
 class CrashAfterWriteExecutor(RecordingExecutor):
     """Writes for real, then dies before the controller learns it happened.
 

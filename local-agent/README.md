@@ -88,12 +88,13 @@ ends at a normalized, bounded, audited rejection with the executor untouched.
 
 ## The filesystem capability
 
-Three tools. Two are read-only — `workspace.read` and `workspace.list` — and
-are what a deployment gets by default. The third, `workspace.write`, is the
-first capability in this project that changes anything, and it is described
-separately below because acquiring it is a deliberate act: it lives in its own
-module, its own registry builder and its own run-context builder, so an
-existing read-only deployment cannot gain it by upgrading.
+Four tools, in three tiers a deployment escalates through on purpose.
+`workspace.read` and `workspace.list` are read-only and are what you get by
+default. `workspace.write` replaces one file. `workspace.append` adds to one,
+and is the first capability here whose failure cannot be retried. Each tier has
+its own module, its own registry builder and its own run-context builder, so no
+deployment acquires a stronger capability by upgrading — only by asking for it
+by name.
 
 The model sees an abstract namespace of exactly two roots and supplies a
 relative path:
@@ -487,6 +488,66 @@ not exactly-once. What it does claim is bounded and tested: the bytes are
 `fsync`ed before the call returns, and nothing is ever written outside the
 authorized root.
 
+## The first non-re-executable mutation
+
+`workspace.append` exists to answer an architectural question rather than to
+add a feature: can this system represent an execution that **may** have
+happened and **must not** be repeated, without collapsing "we do not know" into
+either "it failed" or "it succeeded"?
+
+Four facts had correlated in every capability up to this point:
+
+| | `side_effect_free` | `re_executable` |
+|---|---|---|
+| `workspace.read` (`NONE`) | True | True |
+| `workspace.write` (`IDEMPOTENT`) | False | True |
+| `workspace.append` (`MUTATING`) | **False** | **False** |
+
+Nothing had occupied that third row, so nothing had ever proven the two
+properties were genuinely separate rather than accidentally aligned.
+
+**Why appending, and not the obvious reason.** Non-idempotence is easy to find;
+finding it without widening the architecture is the constraint. `unlink`,
+`rename` and `mkdir` are syscalls this package has never made, and reaching for
+one would mean expanding authority to obtain a semantic property. Appending
+needs none:
+
+    workspace.write    O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW
+    workspace.append   O_WRONLY |                     O_NOFOLLOW | O_APPEND
+
+Strictly fewer capabilities, one flag exchanged. Dropping `O_CREAT` is what
+keeps this from becoming a filesystem-semantics exercise: the destination must
+already exist, so there is no creation mode, no permission choice and no
+truncation to reason about.
+
+**The retry proof, by physical count.** The measurement is not a boolean on a
+dataclass — it is how many irreversible acts a budget of three authorizes. The
+executor performs a real append and then raises a *retryable* error:
+
+    workspace.append  (MUTATING)     ->  1 physical append
+    workspace.write   (IDEMPOTENT)   ->  3 physical writes
+
+Same harness, same error, same budget. Only the classification differs, and the
+second line is the control that makes the first mean something.
+
+**Crash, and the state the milestone is named for.** When the executor appends
+and then dies before the completion record lands, the bytes are on disk and
+nothing knows it. Recovery reports `execution_unknown`, offers **no** resume,
+and says so on both axes — `side_effect_free` False, `re_executable` False. It
+does not claim the effect happened. It does not claim it did not.
+
+A *clean* failure is deliberately different: the controller records
+`ExecutionCompleted(status="failed")`, so the physical call is known to have
+finished badly. Absence of evidence is not evidence of failure, and the two
+states have different names.
+
+**The exit.** Automatic retry and automatic resume are both forbidden here, so
+the run still needs a way to end. `abort` and `terminalize` remain available and
+are pure control-plane transitions: no executor, no model, no fabricated
+completion. What ends is the *run*; the authorization with no completion stays
+on disk beside the terminal record, still saying "unknown". An operator closes
+the run without being allowed to assert what the controller cannot verify.
+
 ## Operator-controlled recovery
 
 Milestone 5 stopped at a plan. This layer lets a human act on one without
@@ -610,7 +671,8 @@ and saying so is more honest than a field that looks like attribution.
       executors/
         file_search.py  the Milestone 1 deterministic fake
         workspace_fs.py the only module permitted to *read* a workspace
-        workspace_write.py the only module permitted to *write* one
+        workspace_write.py the only module permitted to *replace* a file
+        workspace_append.py the only module permitted to *append* to one
       persistence/
         records.py      versioned durable record contracts (pure, no I/O)
         journal.py      the only module permitted to write durable state
@@ -625,11 +687,12 @@ boundary, authorization, policy, retry budget, parser boundary, audit events, a
 read-only filesystem capability, a production model adapter over LocalAI's
 OpenAI-compatible endpoint, a durable run journal with crash recovery and
 observational replay, an operator control plane with bound approvals and
-auditable resume, one constrained artifact writer, and the test suite.
+auditable resume, one constrained artifact writer, one non-re-executable
+mutation, and the test suite.
 
 **Deliberately absent:** every filesystem mutation other than replacing one
-regular file — no delete, rename, mkdir, chmod, copy or append — shell or
-subprocess execution,
+regular file or appending to one — no delete, rename, mkdir, chmod or copy —
+shell or subprocess execution,
 Playwright or any browser, network access outside the model transport, MCP,
 Docker code execution, Qdrant, SQLite, Gemma, llama.cpp, OS-level sandboxing,
 distributed coordination, a CLI binary, authenticated operator identity, and
@@ -650,4 +713,5 @@ modules, so the reader cannot mutate and the writer cannot browse.
 - [`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md) — operator authority, approval binding, revalidation, abort semantics, and why there is no operator identity
 - [`docs/milestone-7-decisions.md`](docs/milestone-7-decisions.md) — the capability contract, the authority matrix, admission, side-effect and retry semantics, and the requirements a future side-effecting capability must satisfy
 - [`docs/milestone-8-decisions.md`](docs/milestone-8-decisions.md) — the constrained artifact writer: path containment under a write, the file-type policy and the liveness finding behind it, size-limit ownership, the bounded idempotency claim, and what is deliberately not guaranteed
+- [`docs/milestone-9-decisions.md`](docs/milestone-9-decisions.md) — the first non-re-executable mutation: why `MUTATING` was measured rather than declared, how the four axes come apart, the retry and recovery proofs, and the operator's terminal path when repeating is unsafe
 - [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/) — working rules for this subproject

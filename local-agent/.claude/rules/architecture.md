@@ -35,6 +35,9 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
 | whether a resolved path is inside its root | `workspace_fs._resolve_within_root` | a string prefix test |
 | whether a *write* destination is inside its root | the same helper, on the destination's **parent**, plus `O_NOFOLLOW` on the leaf | a second containment implementation |
 | whether a destination's file type is writable | `workspace_write.execute`, before the open | an errno discovered afterwards |
+| whether a destination may be *appended to* | `workspace_append.execute`, before the open, with no `O_CREAT` in the flags | a create-if-missing convenience |
+| whether an ambiguous execution may be repeated | `ToolSpec.re_executable`, in both the retry gate and `_available_actions` | the disposition, which answers a different question |
+| how a run whose effect is unknowable ends | an operator `abort` or `terminalize` — a control-plane transition | any path that reaches an executor |
 | filesystem resource ceilings | `policy.FilesystemLimits` | a tool argument |
 | where the model service lives | `model_config.ModelServiceConfig` | model output, ever |
 | model timeout and response ceilings | `model_config.ModelServiceConfig` | the model, or a tool argument |
@@ -168,7 +171,23 @@ table, so a code path that tried to jump from PARSE to EXECUTE would raise
     given check is — with one exception recorded at its site: the
     non-regular-destination check has no syscall behind it and prevents an
     unbounded block, so it is enforcement.
-25. **Detect what you cannot prevent.** A capability's schemas are mutable
+25. **Four axes, four answers.** `side_effect_free`, `re_executable`, the
+    journal's evidence, and the recovery disposition correlated for every
+    capability before `workspace.append` existed. They are not the same
+    question and must never be substituted for one another because they happen
+    to agree. `MUTATING` is the first classification where they come apart, and
+    the gates that read them — the controller's retry branch and
+    `recovery._available_actions` — must both key on `re_executable`.
+26. **Escalation is named, monotonic, and asked for.** Three registry builders
+    and three run-context builders: read, read+replace, read+replace+append.
+    Never add an `include_mutation=True` flag; the distance between "replaces a
+    file" and "cannot be repeated at all" deserves more than a default
+    argument.
+27. **A capability whose effect cannot be verified still has an exit.** When
+    `resume` is withheld, `abort` and `terminalize` remain available, and both
+    are pure state transitions. M9 must not create an operational dead end —
+    and it must not escape one by inventing a path that executes.
+28. **Detect what you cannot prevent.** A capability's schemas are mutable
     classes, so `capability_digest` exists because freezing them is impossible.
     Never describe the digest as a tamper seal, and never treat a missing
     digest as a verified one.

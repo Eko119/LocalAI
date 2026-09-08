@@ -112,6 +112,25 @@ class PhysicalRoots:
         return frozenset(self._roots)
 
 
+# Path *grammar*, kept beside path *containment* deliberately. Milestone 8 put
+# this in the writer; Milestone 9 needed it too, and importing one executor
+# from another would have made the append capability depend on the replace
+# capability for no reason. Splitting a validated relative path is neither a
+# read nor a write — it touches no filesystem — so it lives with the module
+# that owns what a path means, and both writers depend only on that.
+def _split_destination(path: str) -> tuple[str, str]:
+    """Separate the parent directory from the filename.
+
+    Safe because of what the schema already guarantees: `path` is canonical,
+    relative, has no empty segment, no `.`, no `..`, no backslash, no NUL, and
+    no trailing separator. So the last segment is a plain filename and
+    everything before it is a relative directory path — possibly empty, which
+    denotes the root itself.
+    """
+    parent, separator, leaf = path.rpartition("/")
+    return (parent if separator else ""), leaf
+
+
 def _resolve_within_root(root: Path, relative: str) -> Path:
     """Resolve a model-supplied relative path and prove it stays inside `root`.
 

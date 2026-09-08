@@ -71,6 +71,22 @@ class FilesystemLimits:
     # exceed the record ceiling; that is a clean, non-retryable refusal rather
     # than a crash — see `Controller._persist_authorization`.
     max_file_write_bytes: int = 8_192  # 8 KiB
+    # Milestone 9, and a third separate field for the same reason the second
+    # one exists: these three ceilings bound different resources and sharing a
+    # value would let one be raised for one reason and silently widen another.
+    #
+    # Deliberately *tighter* than the write ceiling, which is the one place
+    # this capability's semantics show up in policy. A write replaces, so its
+    # ceiling bounds the artifact's total size. An append accumulates: N
+    # authorized appends grow a file by N times this value, so the per-call
+    # ceiling is not a bound on the artifact at all. Halving it does not make
+    # the growth bounded — nothing here does — it only slows the rate at which
+    # a single authorized run can consume a workspace, and says in the type
+    # system that the two operations were reasoned about separately.
+    #
+    # Like the write ceiling it stays below `records.MAX_ARGUMENTS_BYTES`
+    # (16 KiB), because arguments are persisted before execution.
+    max_file_append_bytes: int = 4_096  # 4 KiB
     max_directory_entries: int = 1_000
     # May tighten, never widen, the schema's structural MAX_PATH_LENGTH.
     max_path_length: int = 1_024
@@ -81,6 +97,7 @@ class FilesystemLimits:
         for name in (
             "max_file_read_bytes",
             "max_file_write_bytes",
+            "max_file_append_bytes",
             "max_directory_entries",
             "max_path_length",
             "max_serialized_result_bytes",

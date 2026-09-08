@@ -11,8 +11,9 @@ package, summarised in [`docs/milestone-1-decisions.md`](docs/milestone-1-decisi
 [`docs/milestone-4-decisions.md`](docs/milestone-4-decisions.md),
 [`docs/milestone-5-decisions.md`](docs/milestone-5-decisions.md),
 [`docs/milestone-6-decisions.md`](docs/milestone-6-decisions.md),
-[`docs/milestone-7-decisions.md`](docs/milestone-7-decisions.md), and
-[`docs/milestone-8-decisions.md`](docs/milestone-8-decisions.md). Where this
+[`docs/milestone-7-decisions.md`](docs/milestone-7-decisions.md),
+[`docs/milestone-8-decisions.md`](docs/milestone-8-decisions.md), and
+[`docs/milestone-9-decisions.md`](docs/milestone-9-decisions.md). Where this
 file and that package disagree, the package wins, and the disagreement should be
 written down rather than resolved silently.
 
@@ -31,8 +32,8 @@ those, it is wrong regardless of how well it works.
 Milestones 1 (deterministic control plane), 2 (read-only filesystem),
 3 (production model adapter), 4 (live integration hardening), 5 (durable run
 state and crash recovery), 6 (operator-controlled recovery), 7 (the capability
-contract) and 8 (the constrained artifact writer) are complete and gated by
-CI.
+contract), 8 (the constrained artifact writer) and 9 (the first
+non-re-executable mutation) are complete and gated by CI.
 
 **Milestone 4 is hardened but not yet observed live.** No LocalAI instance was
 reachable where it was written, so the four live scenarios are implemented and
@@ -45,12 +46,14 @@ policy, retry budget, parser boundary, audit events, the `workspace.read` /
 `workspace.list` capability, the LocalAI model adapter and its transport, the
 durable run journal with its recovery and replay, the operator control plane
 (inspection, decisions, approved resume, abort), the capability admission
-contract, the `workspace.write` capability, and tests.
+contract, the `workspace.write` and `workspace.append` capabilities, and
+tests.
 
 **Explicitly out of scope until a later milestone opens it:** every filesystem
-mutation other than replacing one regular file — delete, rename, mkdir, chmod,
-copy, append — shell or subprocess execution, Playwright or any browser, network
-access outside the model transport, MCP, Docker code execution, Qdrant, SQLite,
+mutation other than replacing one regular file or appending to one — delete,
+rename, mkdir, chmod, copy — shell or subprocess execution, Playwright or any
+browser, network access outside the model transport, MCP, Docker code
+execution, Qdrant, SQLite,
 Gemma, llama.cpp, OS-level sandboxing, distributed coordination, automatic
 *unattended* resumption, authenticated operator identity, and a CLI binary.
 `tests/test_architecture.py` enforces this by parsing the package's own AST —
@@ -58,9 +61,10 @@ adding `import subprocess` fails the suite, it does not merely violate a
 convention.
 
 **Capability grants are per module.** `executors/workspace_fs.py`,
-`executors/workspace_write.py` and `persistence/journal.py` are the only
-production files allowed to touch a disk, and `transports/http.py` is the only
-one allowed a network import. Reading a workspace and writing one are separate
+`executors/workspace_write.py`, `executors/workspace_append.py` and
+`persistence/journal.py` are the only production files allowed to touch a disk,
+and `transports/http.py` is the only one allowed a network import. Reading a
+workspace and writing one are separate
 grants held by separate modules on purpose: `workspace_fs.py` is *provably*
 read-only — its AST is asserted to call no mutating method and to open files
 only in `"rb"` — so putting a writer beside it would have meant weakening those
@@ -112,6 +116,35 @@ check has no second mechanism behind it, because opening a FIFO without
 `O_NONBLOCK` blocks forever and no timeout is enforced anywhere. Never widen
 this into a generic filesystem seam — a new operation must mean a new module, a
 new schema, a new registry entry and new tests.
+
+**Four axes, and Milestone 9 is where they stop correlating.**
+`side_effect_free` asks *could anything have happened*; `re_executable` asks
+*is repeating safe*; the journal holds *what is actually known*; the
+disposition states *what conclusion is justified*. Every capability before
+`workspace.append` made at least two of those agree, so nothing had ever tested
+that they are genuinely separate. Never substitute one for another because they
+happen to align: `side_effect_free == False` must not imply `re_executable ==
+False`, and `re_executable == False` must never be implemented by pretending
+`side_effect_free == True`.
+
+**`workspace.append` is `MUTATING`, measured rather than declared.** Against
+Milestone 8's own written bound — idempotent with respect to the destination's
+existence and content — appending fails it: one request yields `seed\nentry\n`
+and two yield `seed\nentry\nentry\n`. It needed no new authority to build,
+only one flag exchanged (`O_APPEND` in, `O_CREAT` and `O_TRUNC` out), which is
+why it is the *smallest* capability that reaches the fourth corner rather than
+merely the most obviously non-idempotent one. Dropping `O_CREAT` is what makes
+"never creates a file" a property of the flags instead of a guard.
+
+**Unknown is neither failed nor succeeded, and an operator ends the run rather
+than the uncertainty.** A crash between the executor and the completion record
+leaves `execution_unknown`; a *clean* failure is different, because it records
+`ExecutionCompleted(status="failed")` and closes the window. When resume is
+withheld, `abort` and `terminalize` remain available and are pure control-plane
+transitions — no executor, no model, no fabricated completion — so the
+authorization with no completion stays on disk beside the terminal record.
+Milestone 9 required no new operator vocabulary; adding a synonym for
+`terminalize` would have created a second terminal path to keep in step.
 
 **A capability is content-addressed because immutability cannot reach its
 schemas.** `args_schema` and `result_schema` are classes and Python classes are
@@ -192,7 +225,9 @@ commands CI runs, in the same order.
         file_search.py  Milestone 1 deterministic fake
         workspace_fs.py read-only filesystem — sole holder of a read grant
         workspace_write.py the constrained artifact writer — sole holder of a
-                        workspace write grant
+                        workspace replace grant
+        workspace_append.py the first non-re-executable mutation — sole holder
+                        of a workspace append grant
       persistence/
         records.py      versioned durable record contracts (pure, no I/O)
         journal.py      append-only journal — sole holder of the *durable

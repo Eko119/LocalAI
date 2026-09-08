@@ -117,6 +117,17 @@ MODULE_IMPORT_GRANTS: dict[str, frozenset[str]] = {
     # `workspace_fs.py` correspondingly does not gain `os`, so it stays
     # provably read-only.
     "workspace_write.py": frozenset({"os"}),
+    # Milestone 9 opened the first *non-re-executable* mutation, and it needed
+    # no new authority at all: `os` again, and one flag exchanged.
+    #
+    #     Milestone 8   O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW
+    #     Milestone 9   O_WRONLY |                     O_NOFOLLOW | O_APPEND
+    #
+    # Strictly fewer capabilities than the writer holds. Dropping `O_CREAT` is
+    # what makes "never creates a file" a property of the flags rather than of
+    # a guard, and it is why this milestone did not become a filesystem
+    # milestone. The new thing here is the classification, not the syscall.
+    "workspace_append.py": frozenset({"os"}),
 }
 
 # Modules that must never touch a filesystem, whatever else changes. Listed
@@ -150,7 +161,14 @@ FILESYSTEM_MODULES = frozenset(
 #                       model-requested path under an authorized root. It is
 #                       separate from `workspace_fs.py` precisely so that
 #                       module's read-only proofs keep holding.
-FILESYSTEM_GRANT_HOLDERS = frozenset({"workspace_fs.py", "journal.py", "workspace_write.py"})
+#   workspace_append.py (Milestone 9) adds bytes to one existing file under an
+#                       authorized root. Separate from `workspace_write.py`
+#                       because the two carry different `SideEffect` classes:
+#                       one module, one classification, so the AST tests that
+#                       map a module to its side-effect semantics stay exact.
+FILESYSTEM_GRANT_HOLDERS = frozenset(
+    {"workspace_fs.py", "journal.py", "workspace_write.py", "workspace_append.py"}
+)
 
 # Anything that can open a socket, directly or indirectly.
 NETWORK_MODULES = frozenset(
@@ -831,15 +849,15 @@ def test_the_persistence_boundary_check_actually_catches_a_violation() -> None:
     assert "journal" not in _intra_package_imports(SRC / "model_service.py")
 
 
-# The two modules that may put bytes on a disk, and the reason they are listed
-# apart rather than together. `journal.py` writes *controller-owned durable
-# state* — the evidence recovery reasons over. `workspace_write.py` writes a
-# *workspace artifact* — the capability's declared side effect. Conflating them
+# The modules that may put bytes on a disk, listed apart rather than together
+# because they write different *kinds* of thing. `journal.py` writes
+# controller-owned durable state — the evidence recovery reasons over. The two
+# workspace modules write a capability's declared side effect. Conflating them
 # would be the mistake this separation exists to prevent: an executor that
 # could write durable state would be manufacturing the record of its own
 # execution, which `test_no_executor_module_writes_durable_state_or_calls_a_model`
 # independently forbids.
-BYTE_WRITING_MODULES = ("journal.py", "workspace_write.py")
+BYTE_WRITING_MODULES = ("journal.py", "workspace_write.py", "workspace_append.py")
 
 
 def _modules_that_write_bytes() -> list[str]:
@@ -864,7 +882,7 @@ def _modules_that_write_bytes() -> list[str]:
     return writers
 
 
-def test_only_two_named_modules_write_bytes_at_all() -> None:
+def test_only_the_declared_modules_write_bytes_at_all() -> None:
     """The set is closed, and each member is listed for a stated reason.
 
     Read-only opens are not writes: `workspace_fs.py` legitimately opens files
@@ -1262,7 +1280,9 @@ def test_the_bypass_check_actually_catches_a_violation() -> None:
 # that hold authority, and the ownership of every authority-bearing property is
 # asserted rather than described.
 
-EXECUTOR_MODULES = frozenset({"file_search.py", "workspace_fs.py", "workspace_write.py"})
+EXECUTOR_MODULES = frozenset(
+    {"file_search.py", "workspace_fs.py", "workspace_write.py", "workspace_append.py"}
+)
 
 # Modules an executor must never reach at all. Each would let the thing being
 # governed take part in governing it.
@@ -1407,7 +1427,12 @@ def test_only_capability_builders_construct_a_toolspec() -> None:
     definers = [
         path.name for path in _production_modules() if "ToolSpec" in _constructed_types(path)
     ]
-    assert sorted(definers) == ["file_search.py", "workspace_fs.py", "workspace_write.py"]
+    assert sorted(definers) == [
+        "file_search.py",
+        "workspace_append.py",
+        "workspace_fs.py",
+        "workspace_write.py",
+    ]
 
 
 # ---------------------------------------------------------------------------

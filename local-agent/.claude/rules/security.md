@@ -125,6 +125,47 @@ must remain unable to perform the operations they authorize.
   `mtime` does not converge, and a test asserts that it does not. Do not widen
   the claim to filesystem metadata or to an external observer.
 
+### Appending (Milestone 9)
+
+- **`workspace.append` is `MUTATING`, and that is measured.** Against
+  Milestone 8's own written bound — idempotent with respect to the
+  destination's existence and content — appending fails: one request yields
+  `seed\nentry\n`, two yield `seed\nentry\nentry\n`. The difference is
+  content, inside the declared effect. Never reclassify it to make a retry
+  path simpler.
+- **The four axes are four axes.** `side_effect_free` (could anything have
+  happened), `re_executable` (is repeating safe), the journal's evidence, and
+  the recovery disposition are separate questions that happened to correlate
+  until this capability existed. Never substitute one for another because they
+  agree for the capability in front of you. In particular: `side_effect_free
+  == False` must not imply `re_executable == False`, and `re_executable ==
+  False` must never be implemented by pretending `side_effect_free == True`.
+- **Unknown is neither failed nor succeeded.** A crash between the executor
+  and the completion record leaves `execution_unknown`, and it stays that way.
+  A clean failure is *different*: it records `ExecutionCompleted(status=
+  "failed")`, so the physical call is known to have finished. Never collapse
+  the two — absence of evidence is not evidence of failure.
+- **An operator ends the run, not the uncertainty.** `abort` and `terminalize`
+  are control-plane transitions: no executor, no model, no fabricated
+  completion. The `ExecutionAuthorized` record with no completion stays on
+  disk beside the terminal record. Never add an action that asserts the effect
+  did or did not happen.
+- **No `O_CREAT`, no `O_TRUNC`.** The destination must already exist, so
+  "never creates a file" is a property of the flags rather than of a guard.
+  Adding either flag would silently make this a different capability.
+- **The offset belongs to the kernel.** `O_APPEND` positions the write inside
+  the same operation. Never replace it with `seek`-then-`write`: that is two
+  syscalls with a race between them, the same argument that made `O_NOFOLLOW`
+  preferable to a pre-flight symlink check.
+- **A short write is a partial effect, not something to loop away.** Bytes
+  already in the file cannot be taken back, and appending the remainder later
+  is indistinguishable from appending it twice. Report
+  `fs_append_incomplete`; never retry inside the executor.
+- **The append ceiling is tighter than the write ceiling on purpose.** A write
+  replaces, so its ceiling bounds the artifact; an append accumulates, so the
+  per-call ceiling bounds nothing about the artifact. Never raise one for the
+  other's reasons, and keep it below `records.MAX_ARGUMENTS_BYTES`.
+
 ## The model boundary
 
 - **Only the structured-generation channel is eligible.** LocalAI's

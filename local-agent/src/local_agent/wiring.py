@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from .executors.file_search import build_file_search_spec
+from .executors.workspace_append import WorkspaceAppendExecutor, build_workspace_append_spec
 from .executors.workspace_fs import (
     PhysicalRoots,
     RootLocation,
@@ -106,6 +107,42 @@ def build_writable_filesystem_registry(
     )
 
 
+def build_mutating_filesystem_registry(
+    roots: PhysicalRoots,
+    limits: FilesystemLimits = DEFAULT_FILESYSTEM_LIMITS,
+    read_executor: ToolExecutor | None = None,
+    list_executor: ToolExecutor | None = None,
+    write_executor: ToolExecutor | None = None,
+    append_executor: ToolExecutor | None = None,
+) -> ToolRegistry:
+    """The Milestone 9 registry: the readers, the writer, and the appender.
+
+    A *third* named builder rather than an `include_mutation=True` flag on the
+    writable one, for the reason §8 of the milestone gives and Milestone 8
+    established: a keyword is one edit away from being passed by a caller who
+    did not consider it, and the gap between "replaces a file" and "cannot be
+    repeated at all" is exactly the gap that deserves more distance than a
+    default argument.
+
+    So there are now three registries a deployment can ask for, and the
+    escalation is monotonic and explicit:
+
+        build_filesystem_registry           read
+        build_writable_filesystem_registry  read + replace   (IDEMPOTENT)
+        build_mutating_filesystem_registry  read + replace + append (MUTATING)
+
+    Nothing a caller of the first two does can produce the third.
+    """
+    return ToolRegistry(
+        (
+            build_workspace_read_spec(read_executor or WorkspaceReadExecutor(roots, limits)),
+            build_workspace_list_spec(list_executor or WorkspaceListExecutor(roots, limits)),
+            build_workspace_write_spec(write_executor or WorkspaceWriteExecutor(roots, limits)),
+            build_workspace_append_spec(append_executor or WorkspaceAppendExecutor(roots, limits)),
+        )
+    )
+
+
 def build_filesystem_run_context(
     run_id: str,
     authorized_roots: frozenset[str] = frozenset(LEGAL_ROOT_IDS),
@@ -149,6 +186,32 @@ def build_writable_run_context(
     )
 
 
+def build_mutating_run_context(
+    run_id: str,
+    authorized_roots: frozenset[str] = frozenset(LEGAL_ROOT_IDS),
+    limits: FilesystemLimits = DEFAULT_FILESYSTEM_LIMITS,
+    max_attempts: int = 3,
+) -> RunContext:
+    """A run granted the readers, the writer, and the non-re-executable append.
+
+    Separate from `build_writable_run_context` for the same reason that one is
+    separate from the read-only builder. Holding a grant for a capability whose
+    failure cannot be retried is a decision a deployment should have to make on
+    purpose, and the grant is still independent of the registry: a run can hold
+    the mutating registry and not be authorized for `workspace.append`, and
+    `authorize` will refuse it.
+    """
+    return RunContext(
+        run_id=run_id,
+        max_attempts=max_attempts,
+        authorized_tools=frozenset(
+            {"workspace.read", "workspace.list", "workspace.write", "workspace.append"}
+        ),
+        authorized_roots=authorized_roots,
+        filesystem=limits,
+    )
+
+
 # What the model is told each tool is for. Kept here, in trusted wiring, rather
 # than on `ToolSpec`: these strings are written for the model to read, and
 # nothing in the controller consults them.
@@ -157,6 +220,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "workspace.list": "List the entries of a directory in an authorized root.",
     "file_search": "Search for files matching a query in an authorized root.",
     "workspace.write": "Create or replace one file in an authorized root with the given text.",
+    "workspace.append": "Add the given text to the end of an existing file in an authorized root.",
 }
 
 

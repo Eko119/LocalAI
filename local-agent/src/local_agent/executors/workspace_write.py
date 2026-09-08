@@ -83,7 +83,7 @@ from ..registry import (
     ToolSpec,
     admit,
 )
-from .workspace_fs import PhysicalRoots, _resolve_within_root
+from .workspace_fs import PhysicalRoots, _resolve_within_root, _split_destination
 
 # Opened with the destination's final component never followed. `O_TRUNC`
 # replaces content wholesale — this capability has no append or patch mode, so
@@ -95,19 +95,6 @@ _WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
 # exists — so this capability never changes a permission, it only chooses one
 # for a file that did not exist. Owner read/write is the conservative choice.
 _NEW_FILE_MODE = 0o600
-
-
-def _split_destination(path: str) -> tuple[str, str]:
-    """Separate the parent directory from the filename.
-
-    Safe because of what the schema already guarantees: `path` is canonical,
-    relative, has no empty segment, no `.`, no `..`, no backslash, no NUL, and
-    no trailing separator. So the last segment is a plain filename and
-    everything before it is a relative directory path — possibly empty, which
-    denotes the root itself.
-    """
-    parent, separator, leaf = path.rpartition("/")
-    return (parent if separator else ""), leaf
 
 
 class WorkspaceWriteExecutor:

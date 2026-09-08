@@ -243,6 +243,60 @@ class WorkspaceWriteResult(_Strict):
 
 
 # --------------------------------------------------------------------------
+# Non-re-executable mutation (Milestone 9)
+# --------------------------------------------------------------------------
+
+# The same structural relationship `MAX_WRITE_CONTENT_CHARS` has to the write
+# ceiling: a bound on *characters* so a hostile payload cannot force a huge
+# encode before the byte ceiling is applied. The authoritative bound is
+# `policy.FilesystemLimits.max_file_append_bytes`, enforced on encoded UTF-8.
+MAX_APPEND_CONTENT_CHARS = 4 * 4_096
+
+
+class WorkspaceAppendArgs(_Strict):
+    """Arguments for `workspace.append` — the first non-re-executable mutation.
+
+    Deliberately the same shape as `WorkspaceWriteArgs`, and deliberately no
+    larger. The two capabilities differ in *semantics*, not in what the model
+    is allowed to say, so there is no offset, no position, no seek, no mode, no
+    "create if missing", no separator, and no encoding. A caller cannot ask
+    where the bytes go: `O_APPEND` means the kernel decides, at end of file.
+
+    The absence of a `create` flag is the contract, not an oversight. The
+    executor opens without `O_CREAT`, so a missing destination is refused by
+    the syscall rather than by a check someone could later relax.
+    """
+
+    root_id: RootId
+    path: RelativePath = Field(min_length=1, max_length=MAX_PATH_LENGTH)
+    # Text, matching the read and write capabilities. The empty string is
+    # legal and is a well-defined no-op append: it is still a real execution
+    # with a real identity, and pretending otherwise would introduce a
+    # capability-specific special case into an otherwise uniform pipeline.
+    content: str = Field(max_length=MAX_APPEND_CONTENT_CHARS)
+
+
+class WorkspaceAppendResult(_Strict):
+    """Result schema for `workspace.append`.
+
+    `bytes_appended` is what the syscall reported writing, not what the caller
+    asked to write. The difference matters for exactly one case: a short write
+    leaves a partial effect, and reporting the requested count there would be
+    the controller stating something the filesystem never confirmed.
+
+    Note what is absent relative to `WorkspaceWriteResult`: there is no
+    `created` field, because this capability cannot create. And there is no
+    resulting file size, because reporting one would turn every append into a
+    read of surrounding content the request never asked for.
+    """
+
+    status: Literal["success", "error"]
+    root_id: RootId
+    path: str
+    bytes_appended: int
+
+
+# --------------------------------------------------------------------------
 # Model <-> controller channel
 # --------------------------------------------------------------------------
 

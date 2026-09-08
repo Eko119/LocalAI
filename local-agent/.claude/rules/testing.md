@@ -46,6 +46,7 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
 | `test_operator_recovery.py` | recovery end to end: 13 crash windows, safe resume, revalidation, abort semantics, concurrency, model-context security, transparency |
 | `test_capability.py` | the capability contract: the admission matrix, immutability including nested, capability identity, the side-effect/retry/idempotency matrix (cases A–H), executor isolation, the result boundary, authority-named model fields, and the runtime secret sentinels |
 | `test_workspace_write.py` | the constrained artifact writer: containment under a write, the file-type policy, size limits and their journal coupling, authorization, bounded idempotency, retry counts, crash windows, operator recovery, and the result and model boundaries |
+| `test_workspace_append.py` | the first non-re-executable mutation: the fourth corner of the contract, the R(R(S)) != R(S) criterion with an `IDEMPOTENT` control, the retry proof by physical count, recovery cases A-H, the operator terminal path, hostile results, and the M9 decision surface over 52 repetitions |
 | `test_determinism.py` | 200 repetitions per in-memory scenario, 100 per filesystem, model, recovery, and operator scenario |
 | `test_controller_flow.py` | gate ordering, audit events, budget arithmetic |
 | `test_architecture.py` | the capability boundary, enforced against the package AST |
@@ -165,6 +166,22 @@ make every "no read occurred" assertion pass vacuously. Never delete it.
    statement about a *specific* failure mode, and asking a containment
    mechanism to cover an availability failure is a category error that only
    measurement catches.
-25. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
+25. **A retry test for a `MUTATING` capability needs its opposite.** "One
+   physical effect" proves the capability gate only if an otherwise identical
+   `IDEMPOTENT` harness still produces three. Without that control the test
+   would pass just as well if retry were broken outright —
+   `test_the_idempotent_writer_is_still_retried_three_times` is the control,
+   and it must keep failing if retry stops working generally.
+26. **Assert the physical count, not the boolean.** `re_executable is False`
+   is a fact about a dataclass. The milestone's claim is about the world, so
+   the assertion is the number of appends that reached a disk *and* the file's
+   contents. A spy count alone would pass if the bytes went elsewhere.
+27. **A crash is not a failure, and the suite must keep them apart.** A clean
+   executor failure records `ExecutionCompleted(status="failed")` and closes
+   the ambiguity window; only a `SimulatedCrash` leaves it open. Tests that
+   want `execution_unknown` must crash, and there is a sibling test asserting
+   the failure path lands on `execution_completed` instead — collapsing them
+   is the "unknown means failed" error the architecture forbids.
+28. All gates (`uv lock --check`, `pytest`, `ruff check`, `ruff format --check`,
    `mypy`) pass before a change is done. CI runs the same ones in the same
    order.
