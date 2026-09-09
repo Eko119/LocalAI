@@ -632,6 +632,13 @@ class Controller:
                     events=recorder.snapshot(),
                     attempts=attempt,
                     error=last_error,
+                    # Milestone 10 contract §7.6: `executions` counts what this
+                    # invocation verified, and a run that composed two
+                    # executions before failing on a third really did compose
+                    # two. Omitting it here reported 0 for every failing
+                    # terminal — including ceiling exhaustion, which by
+                    # definition can only happen after successful executions.
+                    executions=executions_completed,
                 )
 
             self._enter(machine, recorder, State.RESPOND)

@@ -770,34 +770,157 @@ def _uninterrupted_run(tmp_path: Path, run_id: str) -> Any:
     return outcome, executor, adapter, path, context
 
 
-def test_recovery_is_semantically_transparent(tmp_path: Path) -> None:
-    """Path A and Path B agree on everything the rest of the system can see.
+def _authorization(path: Path) -> Any:
+    """The one `ExecutionAuthorized` record on disk.
 
-    Deliberately *not* asserting byte-identical journals: Path B legitimately
-    carries an extra operator decision, and hiding that would defeat the audit.
-    What must match is the semantic result, the state trace, the verified
-    outcome, and the fact that the model saw nothing either way.
+    Asserting the count is half the point: Milestone 10 contract I9 says a
+    resume writes no second authorization, so a helper that quietly took the
+    last of several would hide the invariant it is used to check.
     """
-    outcome_a, executor_a, adapter_a, _, _ = _uninterrupted_run(tmp_path / "a", "run-direct")
+    found = [record for _, record in _records(path) if record.type == "execution_authorized"]
+    assert len(found) == 1, f"expected exactly one authorization, found {len(found)}"
+    return found[0]
+
+
+def test_recovery_is_semantically_transparent(tmp_path: Path) -> None:
+    """Recovery restores an execution; it does not re-decide one.
+
+    Milestone 6 asserted this by comparing state traces, which worked while a
+    run *was* one execution. Milestone 10 made a fresh run continue past
+    RESPOND to ask for another, so trace equality now compares a composing run
+    against a restoring one and fails for a reason that has nothing to do with
+    transparency. The trace comparison moved to
+    `test_recovery_manufactures_no_model_generation`, which asserts the
+    difference deliberately; what remains here are the durable semantic facts,
+    which is what M6 was really protecting.
+
+    Note what is *not* asserted: that Path A's and Path B's execution ids are
+    equal. They cannot be — `derive_execution_id` hashes the run id and these
+    are two different runs. The identity claim recovery actually makes is
+    internal to Path B: the execution it completes is the one authorized
+    before the crash, byte for byte.
+    """
+    outcome_a, executor_a, adapter_a, path_a, _ = _uninterrupted_run(tmp_path / "a", "run-direct")
 
     crashed = crash_mid_execution(tmp_path / "b", run_id="run-recovered")
+    # Read before the harness takes the lock: this is the authorization as it
+    # stood at the interruption boundary, captured with nothing recovered yet.
+    authorized = _authorization(crashed.path)
+
     harness = build_recovery_harness(crashed)
     recovered = harness.recover(harness.decide("resume", "verified_safe_to_repeat"))
     outcome_b = recovered.run
     assert outcome_b is not None
+    # The harness holds the journal's exclusive lock; release it before
+    # re-reading the file, exactly as the sibling journal tests do.
+    harness.journal.close()
+    settled = _authorization(crashed.path)
 
-    # The model-facing semantic result is identical.
+    # ---- 1. The exact authorized execution identity is reused (I8) --------
+    assert recovered.execution_id == authorized.execution_id
+    # And it is still a function of the operation, not a value carried along:
+    # the completion record on disk names the same execution.
+    completions = [r for _, r in _records(crashed.path) if r.type == "execution_completed"]
+    assert [c.execution_id for c in completions] == [authorized.execution_id]
+
+    # ---- 2. Step identity is reused, not reassigned (I8, I11) -------------
+    # A recovered -s1 stays -s1. Were recovery to treat the restored execution
+    # as a new one it would become -s2 here, and the run would silently have
+    # consumed a second execution slot for the same work.
+    assert authorized.step_id == f"{crashed.run_id}-s1"
+    assert settled.step_id == authorized.step_id
+
+    # ---- 3. The proposal is reused verbatim ------------------------------
+    # The journal carries the *canonical* argument set — what the tool's schema
+    # produced, defaults included — because that is the form the execution id
+    # hashes and the form recovery re-validates. So the model's fields are a
+    # subset of it, not equal to it, and asserting equality here would be
+    # asserting that validation does nothing.
+    proposed = json.loads(VALID_PROPOSAL)
+    assert authorized.tool == proposed["tool"]
+    assert proposed["arguments"].items() <= authorized.arguments.items()
+    # Nothing re-authorized it under different terms.
+    assert settled.arguments == authorized.arguments
+    assert settled.capability_digest == authorized.capability_digest
+    assert settled.side_effect_free == authorized.side_effect_free
+
+    # ---- 4. Attempt semantics: restored, never advanced (I3) -------------
+    assert authorized.attempt == 1
+    assert outcome_b.attempts == authorized.attempt
+    assert outcome_b.terminal.attempts == authorized.attempt
+
+    # ---- 5. Recovery authorized nothing new (I9) -------------------------
+    # `_authorization` already refuses a second record; state it as the
+    # invariant too, so the reason this matters is on the page.
+    assert _types(crashed.path).count("execution_authorized") == 1
+
+    # ---- 6. Executor behaviour -------------------------------------------
+    # One physical execution before the crash, one after recovery — and the
+    # crash window is exactly why that is two rather than one. The number that
+    # would signal a broken resume is a *third*.
+    assert crashed.physical_executions == 1
+    assert harness.executor.call_count == 1
+    assert executor_a.call_count == 1
+
+    # ---- 7. The durable execution result and terminal disposition --------
     assert outcome_a.result is not None and outcome_b.result is not None
     assert outcome_a.result.model_dump(mode="json") == outcome_b.result.model_dump(mode="json")
-    # So is the controller's terminal disposition and the state trace.
     assert outcome_a.terminal.model_dump(mode="json") == outcome_b.terminal.model_dump(mode="json")
-    assert [s.value for s in outcome_a.states] == [s.value for s in outcome_b.states]
-    # Both executed exactly once on their own executor, and both asked the
-    # model exactly what the ordinary path asks.
-    assert executor_a.call_count == 1
-    assert harness.executor.call_count == 1
-    assert adapter_a.call_count == 1
+    assert _types(path_a)[-1] == "run_terminal"
+    assert _types(crashed.path)[-1] == "run_terminal"
+    assert outcome_a.executions == outcome_b.executions == 1
+
+    # ---- 8. The model learned nothing from any of it ----------------------
+    assert adapter_a.call_count == 2  # the proposal, then the completion
     assert harness.adapter.call_count == 0  # the proposal came from the journal
+
+
+def test_recovery_manufactures_no_model_generation(tmp_path: Path) -> None:
+    """Both sides of the Milestone 10 boundary, asserted against each other.
+
+    This is the assertion that replaced state-trace equality, and it is
+    stronger rather than weaker: equality could hold while *both* runs
+    composed, or while both stopped. This names which does which.
+
+    The semantic claim is contract §1 and §7.5. A fresh run, having verified an
+    execution, asks the model whether more work is wanted — an orchestration
+    decision. A recovered run makes no such decision, because the model that
+    produced the original proposal never saw the interruption and holds none of
+    the context a post-recovery "what next?" turn would pretend it holds.
+    """
+    outcome_a, _, adapter_a, _, _ = _uninterrupted_run(tmp_path / "a", "run-direct")
+
+    crashed = crash_mid_execution(tmp_path / "b", run_id="run-recovered")
+    harness = build_recovery_harness(crashed)
+    outcome_b = harness.recover(harness.decide("resume", "verified_safe_to_repeat")).run
+    assert outcome_b is not None
+
+    fresh = [s.value for s in outcome_a.states]
+    resumed = [s.value for s in outcome_b.states]
+
+    # FRESH RUN: composition remains available. RESPOND is followed by
+    # GENERATE, and the run ends only because the model then said so.
+    assert fresh[fresh.index("RESPOND") :] == ["RESPOND", "GENERATE", "PARSE", "TERMINAL"]
+    assert fresh.count("GENERATE") == 2
+
+    # RECOVERED RUN: the restored execution completes and the run stops.
+    assert resumed[resumed.index("RESPOND") :] == ["RESPOND", "TERMINAL"]
+    # Exactly one GENERATE, and it precedes the restored execution rather than
+    # following it. That single entry is not a model call: `_loop` seeded from
+    # the journal makes none, which the adapter count below proves. It is
+    # recorded because the run really did pass through GENERATE before it
+    # crashed — the same run continuing, not a new one skipping gates.
+    assert resumed.count("GENERATE") == 1
+    assert resumed.index("GENERATE") < resumed.index("PARSE")
+
+    # The invariant stated directly rather than inferred from the trace: no
+    # model generation follows the recovered execution.
+    assert harness.adapter.call_count == 0
+    assert adapter_a.call_count == 2
+
+    # And the boundary is a difference in *composition*, not in outcome: the
+    # two runs still agree on everything in the transparency test above.
+    assert outcome_a.terminal.model_dump(mode="json") == outcome_b.terminal.model_dump(mode="json")
 
 
 def test_the_recovered_journal_differs_only_by_its_audit_records(tmp_path: Path) -> None:

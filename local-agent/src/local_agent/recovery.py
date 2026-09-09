@@ -225,6 +225,20 @@ def _validate_sequence(records: list[tuple[int, DurableRecord]], run_context: Ru
     if first.max_attempts != run_context.max_attempts:
         raise RecoveryError("journal_budget_mismatch")
 
+    # Milestone 10 contract §8. The composition ceiling a run began under is
+    # authoritative for that run's whole lifetime, recovery and replay
+    # included. Without this check a run that started with one execution slot
+    # could be recovered under a context offering ten, or the reverse — the
+    # ceiling silently substituted by whatever the live configuration happens
+    # to say. Raised, never reconciled: this is the same discipline as the
+    # budget check immediately above, and for the same reason, because a
+    # ceiling read out of a file would be the journal deciding rather than
+    # recording. A journal predating the field validates as 1 via the record
+    # default, which is the correct reading of a run written before
+    # composition existed.
+    if first.max_executions != run_context.max_executions:
+        raise RecoveryError("journal_execution_ceiling_mismatch")
+
     seen_terminal = False
     for _, record in records:
         if record.run_id != run_context.run_id:

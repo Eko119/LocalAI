@@ -1,335 +1,710 @@
-# Milestone 10 — State Machine Coherence Under Composition
+# Milestone 10 — The Composition and Recovery Contract
 
-Phase 1 stopped: the model-facing contract had no affirmative representation for
-*"no further execution is requested"*, and the only available signal — absence
-of a tool proposal — was already committed, by design and by a named test, to
-meaning *malformed, retry*. That finding was accepted and the contract question
-resolved by decision rather than by reinterpretation.
+**This document is authoritative.** Where the implementation and this document
+disagree, the implementation is wrong. It supersedes the Phase 0/1/2 working
+notes that previously occupied this file, including the `{"type":
+"execution_complete"}` envelope shape that was designed, found unreachable
+through the production adapter, and replaced (§3.7 records why).
 
-**Phase 2 implements the resolution.** The M9 invariant stands untouched:
-absence of a structured tool proposal is still failure, never completion.
+Its subject is one question: *can this controller compose several executions
+inside one run while each execution keeps its own independent semantic
+classification, authorization, identity, journal evidence, retry behaviour,
+recovery disposition and terminal-state semantics?* It is not a workflow
+engine, a DAG, a scheduler or a transaction manager, and nothing below
+introduces one.
 
-## 1. Baseline
+---
 
-HEAD `22c4d7fff43836294eed9ebd08160a09d2ba65e0`, working tree clean.
-`uv lock --check` current; `ruff check` clean; `ruff format --check` 60 files;
-`mypy src tests` clean over 45 source files; **1388 passed, 6 skipped**.
-Named suites: architecture 234, M8 157, M9 115, determinism 52,
-recovery + operator 134.
+## 1. The central distinction
 
-## 2. Execution and run boundaries
+Everything in this contract descends from one sentence:
 
-Established by Phase 0 inspection and unchanged here.
+> **A fresh run may compose. A recovered run may only restore.**
 
-**Run-global:** `run_id`, `max_attempts`, `authorized_tools`,
-`authorized_roots`, `allow_destructive`, `max_results_ceiling`,
-`FilesystemLimits`, and the `RunStarted` / `RunTerminal` records.
-`RunTerminal` carries no execution id, which is correct — terminating ends the
-run, not an execution.
+A fresh run, having verified an execution, asks the model whether more work is
+wanted. That question is an *orchestration decision*, and it belongs to the
+run's forward progress.
 
-**Execution-local:** `step_id`, `tool`, `arguments`, `execution_id`,
-`side_effect_free`, `capability_digest` (all on `ExecutionAuthorized`), plus
-`status` and `reason` on `ExecutionCompleted`.
+A recovered run makes no such decision. Recovery restores and completes the
+execution that was already authorized at the interruption boundary, and then
+stops.
 
-**Attempt-local:** `attempt`, and the derived `tool_call_id`
-(`{step_id}-a{attempt}`). `attempt` participates in `derive_execution_id`, so
-two attempts at the same logical operation are already distinct executions by
-identity.
+The danger this guards against is subtler than a wrong answer. If recovery were
+allowed to continue past the restored execution, its semantic role would change
+silently — from *restoration* into *run extension*. The model that produced the
+original proposal never saw the interruption, never saw the operator's
+decision, and holds none of the orchestration context that a post-recovery
+"what next?" turn would pretend it holds. Manufacturing that turn would invent
+a decision point that did not exist when the run was interrupted, and would
+attribute it to a model that was never asked. A run that crashed after
+execution 2 and was resumed would then quietly become a run that chose to
+perform execution 3 — a choice nobody made.
 
-**Capability-local:** the immutable `ToolSpec` and its digest.
+So the boundary is not a testing convenience. It is a statement about what
+recovery *is*.
 
-The semantic axes are already execution-local at every point they are read.
-Every production read of `side_effect_free` and `re_executable` is scoped to a
-single `spec` or a single record; there is no run-level aggregate anywhere.
+---
 
-## 3. Retry budget — decided: per execution
+## 2. Vocabulary
 
-**`max_attempts` is per execution.** Authorized in Phase 1 and recorded here.
-There is no run-wide retry pool.
+These four words are used precisely throughout, and conflating any two of them
+is the failure mode this milestone exists to prevent.
 
-Phase 0 measured that the three candidate scopes are currently
-*indistinguishable*: `attempt` is initialised once per `_loop` call, and one
-`_loop` call is one run is one execution. Composition forces the choice, and
-per-execution is the right one because the budget's purpose is to bound the
-*repair loop for one proposal*. A model that needs two attempts to get E1's
-arguments right has not spent anything that should be denied to E3.
+A **run** is one invocation of the controller against one `RunContext`. It owns
+`run_id`, the grants, `max_attempts`, `max_executions`, and exactly one
+`RunStarted` and at most one `RunTerminal` record.
 
-The consequence must be stated plainly rather than discovered later: a run
-composing N executions can make up to N × `max_attempts` model calls and up to
-N × `max_attempts` executor invocations in the worst case. That is the accepted
-cost of a per-execution budget, and it is why §4 below requires a *separate*
-run-level bound on the number of executions. The budget bounds repair; it does
-not bound composition, and conflating the two would be the same category error
-Milestone 8 recorded when it asked a containment mechanism to cover an
-availability failure.
+An **execution** is one authorized capability invocation that the controller
+verified. It owns `step_id`, `execution_id`, a tool, a canonical argument set,
+a `capability_digest`, and a side-effect classification. Executions within a
+run are independent: nothing about execution 2 is derived from execution 1, and
+no run-level aggregate of their semantic properties exists anywhere.
 
-## 4. Composition mechanism and the completion contract
+An **attempt** is one try at an execution. It owns `attempt`, the derived
+`tool_call_id` (`{step_id}-a{attempt}`), and — because `attempt` participates
+in `derive_execution_id` — its own execution identity. Two attempts at "the
+same" logical operation are already distinct by identity, which is deliberate:
+the journal must be able to say which physical call happened.
 
-### The Phase 1 finding, preserved
+An **execution slot** is one unit of the run's `max_executions` capacity.
+Slots are consumed by *authorizing new executions*, never by attempts and never
+by restoring an execution that already holds one.
 
-`ModelResponse` carries exactly `reasoning`, `narrative`, `structured_output`;
-`RawToolCall` exactly `tool` and `arguments`; both forbid extra fields, so
-neither could express completion — verified by construction. The one available
-signal, presence or absence of a tool call, is bound by
-`test_a_response_with_no_tool_call_fails_closed` and by three docstrings in
-`model_service.py` to the fail-closed malformed path. Measured: a prose-only
-response makes 3 model calls and terminates `failed / RETRY_EXHAUSTED`.
+---
 
-That is why `RESPOND → GENERATE` alone would have produced a broken run rather
-than composition, and why reinterpreting absence as completion was rejected:
-it would have made model silence mean task success, inverting the fail-closed
-discipline M5 and M9 established.
+## 3. Fresh-run composition
 
-### The chosen shape: `ExecutionComplete`
+### 3.1 What creates an execution boundary
+
+An execution boundary is created by exactly one thing: the controller entering
+`RESPOND` after `VERIFY` accepted a result. At that instant, and only there:
+
+1. `executions_completed` increments;
+2. `execution_finished` is recorded, carrying the step id and the new count;
+3. `execution_index` increments — a *new slot is opened*, not consumed;
+4. `step_id` is recomputed as `f"{run_id}-s{execution_index}"`;
+5. `attempt` resets to 1;
+6. `feedback` is cleared to `None`;
+7. the machine advances `RESPOND → GENERATE`.
+
+Nothing else creates a boundary. A retry does not; a rejection does not; a
+failed execution does not; an operator decision does not.
+
+Note the ordering in step 3: the counter is incremented *after* one execution
+verifies, so `execution_index` names the slot the controller is about to offer,
+and the ceiling test (§5) asks whether that slot exists. This is why the test
+reads `execution_index > max_executions` rather than `>=`.
+
+### 3.2 When an execution receives its identity
+
+At the write-ahead boundary — after `POLICY_CHECK` passed and before the
+executor is invoked:
 
 ```python
-class ExecutionComplete(_Strict):
-    type: Literal["execution_complete"]
+execution_id = derive_execution_id(run_id, step_id, attempt, tool, canonical_args)
 ```
 
-One field, no default, on the structured channel the controller already trusts.
-The reasoning behind each property:
+Identity is therefore content-addressed over four controller-owned facts
+(`run_id`, `step_id`, `attempt`, the *resolved* tool name) and one
+model-influenced fact (the arguments) — and the arguments reach the hash only
+after schema validation, authorization and policy have all accepted them. The
+model can change *which* execution it is proposing; it cannot choose an
+identity, cannot reuse one, and cannot make two different operations share one.
 
-**Why a `type` tag rather than a boolean.** `type: Literal[...]` is the
-project's existing discriminator convention — every durable record in
-`records.py` carries one. A boolean like `{"complete": true}` would raise the
-question of what `{"complete": false}` means, and a field whose false value is
-meaningless is a field that will eventually be misread.
+The identity is durable before any physical effect is possible. That ordering
+is what makes a crash detectable rather than silent: an `ExecutionAuthorized`
+with no matching `ExecutionCompleted` is precisely the ambiguous window.
 
-**Why the tag is required rather than defaulted.** The records use
-`type: Literal["run_started"] = "run_started"` because they are constructed in
-Python. This one arrives from the wire, so a default would make the empty
-object `{}` validate as completion — reintroducing exactly the
-absence-means-completion hazard Phase 1 rejected. The tag is required, so
-completion must be stated.
+### 3.3 Attempt lifecycle
 
-**Why `RawToolCall` is left alone.** The brief requires both semantics to be
-explicit but permits the wire representations to differ. A proposal is already
-explicit by carrying `tool` and `arguments`. Adding a symmetric tag to
-`RawToolCall` would change every existing proposal payload for no semantic
-gain. `RawToolCall` is unmodified.
+`attempt` begins at 1 for every execution. It increments only on the retry edge
+(`FEEDBACK → RETRY → GENERATE`), and only when all three of the following hold:
+the error is in `RETRYABLE_CODES`, the invoked capability is `re_executable`
+(or no capability was reached), and `attempt < max_attempts`. It resets to 1
+only at a composition boundary (§3.1).
 
-**Why confusion is structurally impossible.** Both types set
-`extra="forbid"`. A payload carrying both a tag and tool fields validates as
-neither: `{"type": "execution_complete", "tool": "x"}` is rejected by
-`ExecutionComplete` for the extra field, and
-`{"tool": "x", "arguments": {}, "type": "execution_complete"}` is rejected by
-`RawToolCall` for the same reason. Ambiguity is refused by the schemas, not by
-a precedence rule someone could later reorder.
+`attempt` is bounded by `max_attempts`, which is **per execution**. There is no
+run-wide retry pool. A model that needed two attempts to get execution 1's
+arguments right has spent nothing that execution 3 is owed.
 
-**One parser, not two.** `parse_candidate` returns
-`RawToolCall | ExecutionComplete`, dispatching on the presence of the `type`
-key. Architecture rule 10 forbids a second parser beside it, so completion is
-recognised inside the existing boundary rather than in a sibling function. A
-payload carrying `type` with any other value is rejected outright rather than
-falling through to the proposal branch — fail-closed on an unrecognised tag.
+The stated consequence, so it is never discovered later: a run composing N
+executions may make up to N × `max_attempts` model calls and up to
+N × `max_attempts` executor invocations. That is the accepted cost of a
+per-execution budget, and it is exactly why §5's separate run-level ceiling
+exists. The budget bounds *repair*; it does not bound *composition*.
 
-**Absence is unchanged.** `structured_output` that is `None`, empty, or
-unparseable still yields `TOOL_CALL_MALFORMED`. The M9 invariant is untouched
-and its test is unmodified.
+### 3.4 Step identity
 
-## 5. Execution ceiling — `max_executions`
+`step_id` is `f"{run_id}-s{execution_index}"`. `execution_index` is a
+controller-owned integer starting at 1.
 
-**`max_executions` is a run-level composition ceiling, constitutionally
-distinct from `max_attempts`.** They answer different questions and neither is
-derived from, decremented by, or substituted for the other:
+**`step_id` increments once per authorized execution, never per attempt.** A
+retry of execution 2 stays inside execution 2's attempt sequence and keeps
+`-s2`; it never becomes `-s3`. This is the single most load-bearing identity
+rule in the milestone, because a step id that moved on retry would make the
+journal describe a composed run where a retried one actually happened.
 
-| | question | scope | default |
+### 3.5 Model output cannot control execution or step identity
+
+`execution_index` derives from nothing external: no wall clock, no UUID, no
+randomness, no ambient state, and no model output. `step_id` is a pure function
+of `run_id` and that counter. `execution_id` is a hash whose only
+model-influenced input is an argument set that three gates have already
+accepted.
+
+There is no field on `ModelResponse`, `RawToolCall` or `ExecutionComplete`
+through which a step id, an execution id, an attempt number, a state, a budget
+or a ceiling can be expressed — all three types set `extra="forbid"`, so an
+envelope carrying a smuggled control field is rejected as malformed rather than
+partially honoured.
+
+### 3.6 When the controller asks for another execution
+
+**Unconditionally, after every verified execution in a fresh run.** The ceiling
+is deliberately *not* consulted at the boundary.
+
+The rejected alternative was to stop asking once capacity is gone and terminate
+successfully. That would report a run as complete when the model may have had
+further work — conflating *"the ceiling was reached"* with *"the task is
+finished"*. Those are exactly the two facts this milestone exists to keep
+apart, and reporting truncation as success is a silent-truncation failure. So
+the question is always asked, and a request beyond the ceiling is refused
+loudly (§5).
+
+### 3.7 How the completion signal reaches terminal routing
+
+The structured channel carries two shapes, discriminated by a reserved
+capability name:
+
+```python
+COMPLETION_TOOL = "execution.complete"
+
+
+class ExecutionComplete(_Strict):
+    tool: Literal["execution.complete"]
+    arguments: dict[str, Any] = Field(default_factory=dict)  # must be empty
+```
+
+`parse_candidate` — one parser, not two — dispatches on
+`payload.get("tool") == COMPLETION_TOOL` *before* a `RawToolCall` is
+constructed, so a completion can never become a proposal. `registry.admit`
+refuses the reserved name (`capability_name_is_reserved`), so it can never
+resolve to a capability either. A completion carrying arguments is a *malformed
+completion*, not a proposal in disguise.
+
+**Why a reserved tool name rather than a `type` tag.** The originally designed
+`{"type": "execution_complete"}` envelope was correct in the abstract and
+unreachable in practice: the production adapter builds `structured_output`
+from `message.tool_calls`, so it can emit `{"tool": ..., "arguments": ...}` and
+nothing else. A completion contract that only the test double could express
+would have been a contract the deployed system does not have. The reserved name
+is expressible over the wire, which is the property that matters.
+
+**Absence is unchanged.** `structured_output` that is `None`, empty, non-JSON,
+or not a JSON object still yields `TOOL_CALL_MALFORMED`. Silence is never
+success. The Milestone 9 invariant and its named test are untouched.
+
+---
+
+## 4. Completion authority
+
+> **A completion signal is a model-level terminal *request*, not terminal
+> *authority*.**
+
+The model may ask that the run end. Only the controller decides whether it may.
+Three rules follow, and each closes a specific laundering path:
+
+**4.1 Completion at a valid composition boundary may lead to `TERMINAL`.**
+`PARSE → TERMINAL`, status `succeeded`, reporting `last_result` and
+`last_execution_attempts` — the result and attempt count of the last execution
+the controller actually verified, never a number the model supplied.
+
+**4.2 Completion while an outstanding rejection remains unresolved is
+refused.** The controller asks two different questions and they admit different
+answers. After a rejection it asks *"repair this proposal"*; after a verified
+execution it asks *"anything else?"*. Only the second admits a completion.
+
+Without this rule a model told its proposal was denied could answer "complete"
+and the run would report `succeeded` — the model deciding a run's outcome,
+which is the one thing every gate in the pipeline exists to prevent. The
+refusal therefore terminates the run on the error that was actually
+outstanding, not on a new error about the completion: the failure is the
+proposal nobody repaired, and saying "I am finished" did not create a second,
+different problem.
+
+The condition is `feedback is not None`, which holds exactly when a rejection
+in the current execution has not yet been repaired.
+
+**4.3 Completion after execution-ceiling exhaustion does not convert exhaustion
+into success.** This needs stating precisely, because the naive reading is
+wrong in a way that matters.
+
+The ceiling gates *execution requests*. It does not gate termination. So when
+the ceiling is full and the model sends a completion, no denial has occurred —
+nothing was requested, so nothing was refused — and the run terminates
+`succeeded`, reporting exactly the executions that were verified. That is not
+laundering; it is the honest outcome of a run that used its capacity and then
+finished.
+
+Exhaustion becomes a *failure* only when the model proposes further work with
+no slot left (§5). And a completion cannot reverse that failure, by two
+independent mechanisms: `POLICY_DENIED` is not in `RETRYABLE_CODES`, so the run
+is terminal before another model turn exists; and were it ever made retryable,
+rule 4.2 would refuse the completion because the denial would be outstanding.
+
+**4.4 Completion never bypasses an outstanding controller obligation.** 4.2 and
+4.3 are the two instances that exist today. The general rule is stated
+separately so that a future obligation inherits it by default rather than by
+someone remembering to add a branch.
+
+---
+
+## 5. The execution ceiling
+
+`max_executions` is a **run-level composition ceiling**, constitutionally
+distinct from `max_attempts`. Neither is derived from, decremented by, or
+substituted for the other.
+
+| | question it answers | scope | default |
 |---|---|---|---|
 | `max_attempts` | how many attempts may *this execution* receive? | execution | 3 |
 | `max_executions` | how many independent executions may *this run* contain? | run | 1 |
 
-For `max_executions = N` and `max_attempts = M` the worst case is N × M
-attempts, with each axis retaining independent meaning.
+They are validated independently (`max_attempts < 1` and `max_executions < 1`
+are separate `ValueError`s, neither checked against the other): a run with one
+execution and three attempts is as legitimate as one with three executions and
+one attempt.
 
-**Why the default is 1.** It reproduces the pre-M10 contract exactly: a run
-composes one execution unless a deployment asks for more. Composition is
-opt-in, in the same spirit as the three separate registry builders M8 and M9
-established — a stronger capability has to be requested by name.
+**Why the default is 1.** It reproduces the pre-M10 contract exactly. A run
+composes one execution unless a deployment asks for more; composition is
+opt-in, in the same spirit as the separate registry builders M8 and M9 added.
 
-**Ownership.** `RunContext`, alongside `max_attempts`, `max_results_ceiling`
-and the filesystem limits. It is a run-level operational ceiling and that is
-already the structure that owns those; no new subsystem, no manager, no
-scheduler.
+**Where it is checked.** After `PARSE`, before `VALIDATE`. A proposal arriving
+with `execution_index > max_executions` is refused at the authority boundary,
+so it never reaches `VALIDATE`, `AUTHORIZE`, `POLICY_CHECK` or any executor.
+The refusal is `POLICY_DENIED`, which is not retryable, so it consumes no
+retry budget and moves no attempt counter — the ceiling is not a failure of
+*this* execution, it is the run's capacity running out. The run terminates
+`failed` with an auditable `execution_ceiling_exhausted` event.
 
-**The ceiling is checked after parsing and before authorization.** A proposal
-arriving when the ceiling is already consumed is refused at the authority
-boundary, so it never reaches VALIDATE, AUTHORIZE, POLICY_CHECK or the
-executor. The refusal is `POLICY_DENIED`, which is already non-retryable, so
-it consumes no retry budget and does not increment any attempt counter. The run
-terminates failed with an auditable `execution_ceiling_exhausted` event.
+**Slots are consumed by authorization, not by attempts and not by resumption.**
+See §7.4.
 
-**Why the controller asks even when the ceiling is full.** The alternative —
-stop asking once capacity is gone and terminate successfully — was rejected. It
-would report a run as *complete* when the model may have had further work,
-which conflates "the ceiling was reached" with "the task is finished". Those
-are exactly the kind of two facts this milestone exists to keep apart, and
-reporting truncation as success is the silent-truncation failure the brief
-forbids. So the model is always asked, and a proposal it makes beyond the
-ceiling is refused loudly.
+---
 
-## 6. Composition and termination
+## 6. Controller authority
 
-A run ends in exactly one of these ways, each deterministic:
+> **The model may state; only the controller may decide.**
 
-* **explicit completion** — the model returns `ExecutionComplete`; the run
-  terminates `succeeded`;
-* **ceiling exhausted** — the model proposes when `execution_count >=
-  max_executions`; the run terminates `failed` with `POLICY_DENIED`;
-* **execution failure** — an execution fails non-retryably or exhausts its own
-  `max_attempts`, exactly as before;
-* **operator termination** — `abort` or `terminalize`, unchanged.
+Every model output is an untrusted request, evaluated against state the model
+cannot observe or influence:
 
-Absence of a proposal remains `TOOL_CALL_MALFORMED`, retried within the current
-execution's budget, terminating `RETRY_EXHAUSTED`. Unchanged from M9.
+* **model proposals are untrusted requests** — parsed, schema-validated,
+  authorized, policy-checked, executed and verified before anything happens,
+  with any gate able to end the run;
+* **the reserved completion signal is an untrusted request** — it is validated
+  by the same parser at the same boundary, and §4 governs whether it is
+  honoured;
+* **model-provided identity is never authoritative** — there is no channel
+  through which a model can name a run, step, execution, attempt, state or
+  budget;
+* **the controller owns execution identity** — `derive_execution_id` over
+  controller-owned position and post-gate arguments;
+* **the controller owns step identity** — a private counter (§3.4);
+* **the controller owns authorization** — the registry, the grants, the digest,
+  and the gates, re-run from scratch on every path including recovery;
+* **the controller owns terminality** — `Run.advance` consults `TRANSITIONS`
+  and raises `IllegalStateTransitionError` otherwise; `TERMINAL` has no
+  outgoing edges.
 
-## 5b. Step identity
+**No model output may directly cause successful termination.** In a fresh run,
+`succeeded` requires *both* that the controller verified every execution it
+counted *and* that the controller chose to honour an affirmative completion. In
+a recovered run, `succeeded` requires the restored execution to verify, and no
+model output participates at all — the adapter is never called.
 
-`step_id` becomes `f"{run_id}-s{execution_index}"` where `execution_index` is a
-controller-owned counter incremented once per *authorized execution* — not per
-attempt. A retry of E2 stays within E2's attempt sequence and keeps `-s2`; it
-never becomes E3. The counter derives from nothing external: no wall clock, no
-UUID, no randomness, no model output.
+---
 
-Resume continues to take its `step_id` from `_ResumeSeed`. A resumed execution
-is not a new execution, and assigning it a fresh step id would change its
-execution identity and make recovery reject its own journal.
+## 7. The recovery boundary
 
-## 7. Replay coherence
+**Recovery is the restoration and completion of the already-authorized
+execution at the interruption boundary.** It is not a new run, not a new
+execution, and not a continuation of orchestration.
 
-Phase 0 found (G2) that `replay` reconstructs state sequences the live machine
-forbids: given a three-execution journal it produced `VERIFY → PARSE` twice,
-both absent from `TRANSITIONS`. `replay` appends states to a list without
-consulting the authoritative transition relation.
+### 7.1 What is persisted
 
-This is observational rather than a security hole — replay takes no executor
-and never feeds the controller — but "state machine coherence under
-composition" is precisely this milestone's subject, and here the reconstruction
-and the authority table disagree. The correction is to validate each
-reconstructed transition against `TRANSITIONS`, which also makes replay a
-second, independent check that the journal describes a run the controller could
-actually have produced.
+The journal is the whole of the durable state. Five record types:
 
-**This correction is independent of §4 and could land on its own.** It is
-recorded here rather than applied because Phase 1's Step 3 sequences it after
-the composition mechanism, and applying half a milestone's production changes
-while its central contract is unresolved would leave the tree in a state
-neither M9 nor M10.
+| record | carries |
+|---|---|
+| `RunStarted` | `run_id`, `max_attempts`, **`max_executions`**, `schema_version` |
+| `ExecutionAuthorized` | `run_id`, `step_id`, `attempt`, `tool`, canonical `arguments`, `execution_id`, `side_effect_free`, `capability_digest` |
+| `ExecutionCompleted` | `run_id`, `execution_id`, `status`, `reason` |
+| `OperatorDecisionRecorded` | `decision_sequence`, `action`, `plan_id`, `expected_execution_id`, `reason_code` |
+| `RunTerminal` | `status`, `code`, `attempts` |
 
-## 8. Recovery semantics
+The conversation is deliberately **not** persisted, which is why `recover()`
+takes `messages` from its caller.
 
-No change required, and this is the strongest evidence that composition is not
-architecturally forbidden. Measured in Phase 0 against synthetic
-three-execution journals:
+### 7.2 What is reconstructed rather than trusted
 
-* E1 complete, E2 complete, E3 pending → disposition `execution_unknown`, tool
-  `workspace.append`, `step_id` `-s3`, `side_effect_free` False,
-  `re_executable` False, actions `abort / terminalize / acknowledge /
-  reject_recovery`, **no resume**. The run is not converted wholesale to
-  unknown; the uncertainty is localised to E3.
-* Two simultaneously pending executions → `RecoveryError(
-  "journal_multiple_pending_executions")`. Fail-closed and correct.
-* All complete → the plan describes `list(authorizations)[-1]`, the highest
-  sequence. Earlier executions are read and validated but not surfaced in the
-  plan (Phase 0 gap G4) — defensible for a resume decision, incomplete as a
-  description of the run.
+Nothing in the journal is believed on its own authority. `plan_recovery`
+re-derives everything against live authority, and `_revalidate_recovery` then
+does it *again* after the operator decision is durable — because an approval is
+a statement about a moment, and the moment ends the instant the decision is
+recorded.
 
-## 9. M6 compatibility
+Reconstructed: the `ToolSpec` from the live registry; the arguments
+re-validated against that tool's *current* schema; both gates re-run against
+the live `RunContext`; the capability digest re-computed and compared; the
+execution identity re-derived and compared against both the journal and the
+operator's `expected_execution_id`.
 
-M10 is an intentional extension of the M6 single-execution contract, and M6
-remains historically accepted. Precisely:
+### 7.3 What is reused
 
-* M6 established how a **successful execution terminates** for the
-  single-execution controller that then existed. That contract was correct for
-  the architecture it described.
-* M10 extends the controller to permit **subsequent executions** after a
-  successful one. It changes composition, not the meaning of a successful
-  execution.
-* The execution-local authority semantics established by M6, M7, M8 and M9 —
-  admission, capability identity, the digest, the three-valued side-effect
-  classification, both derived properties, the retry gate, the recovery
-  dispositions, and the operator's execution-bound terminal decisions — remain
-  intact and unmodified.
-* M6's §22.8 documented deviation rested on the observation that a successful
-  single-tool run terminates through `RESPOND → TERMINAL`. M10 adds an
-  alternative outgoing edge; it does not remove that one. A run that composes
-  one execution still terminates exactly as M6 described.
+| reused | source | failure if it disagrees |
+|---|---|---|
+| execution identity | journal, re-derived | `execution_identity_mismatch` |
+| step identity | journal (`_ResumeSeed.step_id`) | `execution_position_changed` |
+| proposal: tool + arguments | journal, re-validated | `tool_changed` / `arguments_changed` |
+| attempt number | journal (`_ResumeSeed.attempt`) | `execution_position_changed` |
+| the write-ahead authorization | the record already on disk | — |
 
-M6 history is not rewritten.
+A resume writes **no second `ExecutionAuthorized`**. The record already on disk
+*is* the authorization; writing another would forge one the controller never
+made, and recovery would then reject its own journal for a duplicate.
 
-## 10. Determinism
+### 7.4 Slots, and what recovery does not consume
 
-Nothing in the design introduces wall-clock time, randomness, iteration-order
-dependence or ambient state. Step ids come from a controller-owned counter;
-execution ids are content hashes; journal ordering comes from the recorded
-sequence, with duplicates and gaps refused. Phase 0 confirmed no dependency on
-set iteration, filesystem enumeration or timestamps anywhere in the ordering
-path.
+> **Resuming an already-authorized execution does not consume a second
+> execution slot for that same execution.**
 
-## 11. Rejected alternatives
+A recovered `-s2` remains `-s2`. Recovery does not transform it into a
+newly-authorized `-s3`. This follows structurally rather than by a guard:
+`_loop` takes its `step_id` from the seed, `execution_index` is never
+incremented on the resumed path, and the composition boundary is not reached.
 
-**Treating "no tool call proposed" as run completion.** Rejected for the three
-reasons in §4: it inverts a named fail-closed test, it makes one wire value
-mean two different things depending on position, and it makes model silence
-indistinguishable from task success. This is the alternative that would have
-let Phase 1 proceed today, and rejecting it is the substance of this document.
+### 7.5 What recovery does not manufacture
 
-**A `has_more` / `continue_execution` boolean on `ModelResponse`.** This is on
-the Phase 1 prohibition list, and rightly: it is a control field on an
-untrusted channel. Note that A1 in §4 is *not* this — a completion envelope on
-the structured channel is a proposal-shaped statement the parser validates,
-not a boolean the controller obeys.
+> **Recovery must not manufacture a new model generation after the recovered
+> execution completes.**
 
-**A caller-supplied plan or step list.** That is a workflow, and it would move
-the decision of *which capabilities run* from the model's proposals to a
-static structure. Explicitly out of scope.
+This is a semantic boundary, not a test-specific behaviour. Concretely: a
+resumed run that verifies terminates `RESPOND → TERMINAL`, and the model
+adapter is called **zero** times across the whole recovery.
 
-**A scheduler, execution queue, orchestrator or DAG.** Not needed and not
-built. Phase 0 confirmed no such abstraction exists in `src/` — the only
-matches for those terms are a docstring calling the authority pipeline a
-"pipeline" and three disclaimers saying *not transactional* and *not
-rollback-safe*. Composition needs the existing loop to be allowed to go round
-again, not a manager for a list of operations.
+The states `RECEIVE → CLASSIFY → GENERATE` *are* walked when `recover()` enters
+the loop, because the run really did pass through them before it crashed — the
+same run is continuing, not a new one skipping gates. `_loop` with a seed makes
+no model call there. The invariant is about the *second* generation: a fresh
+run re-enters `GENERATE` after `RESPOND`; a recovered run does not.
 
-**`while True` with an implicit termination heuristic.** Prohibited, and in any
-case it is the same thing as the first rejected alternative wearing different
-clothes.
+A resumed execution that *fails* and still has attempt budget continues into an
+ordinary retry, which does call the model — that is repair of the restored
+execution, not extension of the run, and it stays inside the restored
+execution's step id and attempt sequence.
 
-## 12. Findings
+### 7.6 Execution count on the recovered path
 
-**PROVEN** (Phase 0 and Phase 1 measurement, unchanged baseline):
+`RunOutcome.executions` counts the executions **this invocation verified**. A
+resume reports 1.
 
-* The live controller performs exactly one execution per run. Two valid
-  proposals produce one execution, one model call, and one payload on disk.
-* `TRANSITIONS[RESPOND] = {TERMINAL}` and `TRANSITIONS[TERMINAL] = {}`; a
-  second execution after a successful first is unreachable, not merely
-  un-implemented.
-* The journal, `plan_recovery` and `replay` already accept and reason over
-  multi-execution histories; mixed semantics are localised correctly.
-* Two simultaneously pending executions fail closed.
-* Three distinct capability digests, three distinct execution identities, and
-  per-record `side_effect_free` — no run-level aggregate exists.
-* `ModelResponse` and `RawToolCall` cannot express completion or continuation;
-  both refuse extra fields.
-* A prose-only response terminates a run `failed / RETRY_EXHAUSTED` after 3
-  model calls, so `RESPOND → GENERATE` alone would break composition rather
-  than enable it.
-* `replay` reconstructs `VERIFY → PARSE`, a transition absent from the
-  authoritative table.
+The run-level total is not restored, and this is a deliberate refusal rather
+than an oversight: **the durable record set cannot express it.**
+`ExecutionCompleted(status="succeeded")` is written immediately after the
+executor returns and *before* `VERIFY` runs, so the journal records that the
+physical call finished, not that the controller accepted its result. A count
+derived from those records would therefore include executions that failed
+verification — it would be a fabricated number wearing the name of a real one.
 
-**ASSUMED:** everything M5–M9 assumed (`fsync` durability, append ordering,
-advisory `flock`, POSIX semantics, `O_NOFOLLOW` and `O_APPEND` honoured,
-trustworthy configured roots, no in-process circumvention of the registry).
+Reporting a per-invocation count with a stated meaning is honest; reconstructing
+a run total from evidence that cannot support it is not. Closing this properly
+needs a new durable fact (a verification record, or a status written at
+`RESPOND`); that is recorded as gap **G-VERIFY** in §11 and is deliberately not
+invented here.
 
-**UNPROVEN:** that any deployed LocalAI instance populates
-`choices[].finish_reason` — M4's live path has never been observed, which is
-the specific reason option A2 in §4 is not recommended over A1. Also unproven:
-that a model will comply with an affirmative completion signal, which is why
-§4(B)'s ceiling is required rather than optional.
+Nothing depends on the missing total today: a resumed run does not compose, so
+no ceiling decision consults it.
 
-**DEFERRED:** the composition implementation itself, pending the §4 contract
-decision. The `replay` transition-coherence correction (§7), which is
-independent and could land separately. Phase 0 gap G4 (recovery plans describe
-only the latest execution when none is pending). Enforced execution deadlines
-— M8's `timeout_seconds` debt, carried forward unchanged and still not
-silently made to look enforced.
+### 7.7 Journal facts that establish the recovery boundary
+
+The interruption boundary is established entirely by evidence, never by
+inference:
+
+* **an execution is pending** iff an `ExecutionAuthorized` exists with no
+  matching `ExecutionCompleted`;
+* **more than one pending execution** → `journal_multiple_pending_executions`.
+  The controller authorizes one execution at a time, so two pending records
+  describe a run this controller could not have produced;
+* **a completion with no authorization** → forged result,
+  `journal_completion_without_authorization`;
+* **duplicates** → `journal_duplicate_authorization`,
+  `journal_duplicate_completion`, `journal_duplicate_run_started`;
+* **anything after a `RunTerminal`** → `journal_record_after_terminal`;
+* **the disposition of a pending execution** is `execution_pending_repeatable`
+  when the authorization recorded `side_effect_free`, else `execution_unknown`.
+  Resume is offered only when the capability is `re_executable`.
+
+---
+
+## 8. Persisted ceiling authority
+
+> **The execution ceiling persisted in `RunStarted` is authoritative for the
+> lifetime of the run, including recovery and replay.**
+
+Recovery and replay must not silently substitute a new default, the current
+configuration, a different `max_executions`, or `max_attempts` for the ceiling
+under which the run originally began.
+
+**The defined failure:** if `RunStarted.max_executions != RunContext.max_executions`,
+`_validate_sequence` raises `RecoveryError("journal_execution_ceiling_mismatch")`.
+It is raised, never repaired: the ceiling is not reconciled, defaulted, widened,
+narrowed, or taken from whichever side looks more plausible.
+
+This is deliberately symmetric with the existing
+`journal_budget_mismatch` for `max_attempts`, and it sits in
+`_validate_sequence`, which both `plan_recovery` and `replay` call — so one
+implementation serves both paths and neither can drift from the other.
+
+A journal predating the field validates as `max_executions = 1` via the record
+default, which is the correct reading: a run written before composition existed
+composed one execution.
+
+---
+
+## 9. Replay
+
+Replay reconstructs a run's observable shape from its journal. It takes no
+executor, no adapter and no transport; it reads the registry only to
+re-validate records, never to reach `ToolSpec.executor`. **Replay executes
+nothing**, and a malicious journal has nothing here to trigger.
+
+**What constitutes a completed execution** — for replay and for recovery
+alike — is an `ExecutionAuthorized` paired with an `ExecutionCompleted` for the
+same `execution_id`. That pairing is the durable fact. It states that the
+physical call finished; it does *not* state that verification accepted the
+result (§7.6).
+
+**How duplicate execution is prevented:** replay never executes, so the
+question is really whether *recovery* can re-run something already done. It
+cannot: a paired authorization is not pending, only pending executions are
+resume candidates, a `RunTerminal` makes the whole run disposition `terminal`
+with no available actions, and terminality is immutable
+(`journal_record_after_terminal`).
+
+**Identity under replay** is read, never re-assigned. `execution_ids` are
+reported in journal order. Replay assigns no step ids and no execution ids of
+its own; it has no counter.
+
+**The persisted ceiling participates in replay validation** through
+`_validate_sequence` (§8) — replay calls `plan_recovery` first precisely so
+that replaying an untrusted journal is not a way to bypass the checks recovery
+applies.
+
+**Contradictory or incomplete durable state** fails closed with the named
+`RecoveryError` slugs in §7.7. Replay raises them rather than reconstructing a
+best-effort trace, because a partial reconstruction of a journal that cannot be
+validated would be a story rather than evidence.
+
+**Known divergence, deferred:** replay's state reconstruction is *not* faithful
+under composition. It appends `PARSE…EXECUTE` per authorization and
+`VERIFY`/`FEEDBACK` per completion, so a multi-execution journal yields
+`VERIFY → PARSE`, a transition absent from `TRANSITIONS`. The controller
+actually walks `VERIFY → RESPOND → GENERATE → PARSE`. This is recorded as gap
+**G-REPLAY** in §11, is observational rather than a security hole, and is not
+patched here because §12's contract-first rule sequences it after this
+document.
+
+---
+
+## 10. Boundary-condition routing
+
+Two tables over the same eleven cases: the first is control flow, the second is
+accounting. "Fresh" means `seed is None`.
+
+### 10.1 Routing
+
+| # | input / event | current state | controller decision | resulting states | terminal result |
+|---|---|---|---|---|---|
+| 1 | valid proposal, slot available | PARSE | accept; run every gate | VALIDATE → AUTHORIZE → POLICY_CHECK → EXECUTE → VERIFY → RESPOND → GENERATE | non-terminal |
+| 2 | malformed output (absent / non-JSON / non-object / unknown shape) | PARSE | `TOOL_CALL_MALFORMED`, retryable | FEEDBACK → RETRY → GENERATE, or FEEDBACK → TERMINAL | non-terminal, or `failed / RETRY_EXHAUSTED` |
+| 3 | rejected proposal (schema / tool / grant / policy) | VALIDATE, AUTHORIZE or POLICY_CHECK | reject with its own code | FEEDBACK → RETRY → GENERATE (`SCHEMA_INVALID` only) or FEEDBACK → TERMINAL | non-terminal, or `failed / <code>` |
+| 4 | completion while a rejection is outstanding | PARSE | **refuse** (§4.2); terminate on the *outstanding* error | FEEDBACK → TERMINAL | `failed / <outstanding code>` |
+| 5 | executor raised | EXECUTE | record completion `failed`; consult retryability **and** re-executability | FEEDBACK → RETRY → GENERATE, or FEEDBACK → TERMINAL | non-terminal, or `failed` |
+| 6 | retry succeeds at attempt k+1 | PARSE (same step id) | accept; same slot, new attempt | VALIDATE → … → RESPOND → GENERATE | non-terminal |
+| 7 | retry exhausted (`attempt == max_attempts`) | FEEDBACK | no budget | TERMINAL | `failed / RETRY_EXHAUSTED` |
+| 8 | proposal with `execution_index > max_executions` | PARSE | `POLICY_DENIED` before VALIDATE (§5) | FEEDBACK → TERMINAL | `failed / POLICY_DENIED` |
+| 9 | completion with the ceiling full | PARSE | honour it — the ceiling gates requests, not termination (§4.3) | TERMINAL | `succeeded` |
+| 10 | recovery: resume of a pending execution | PARSE (seeded) | restore; re-validate everything; run the ordinary gates | VALIDATE → AUTHORIZE → POLICY_CHECK → EXECUTE → VERIFY → RESPOND → TERMINAL | `succeeded` |
+| 11 | replay of an already-completed execution | — (no machine) | reconstruct only | reconstructed trace | none — replay has no terminal authority |
+
+### 10.2 Accounting
+
+| # | journal records written | events recorded | attempt changes? | execution count changes? | another model generation? |
+|---|---|---|---|---|---|
+| 1 | `ExecutionAuthorized`, `ExecutionCompleted(succeeded)` | `candidate_parsed`, `execution_started`, `execution_succeeded`, `execution_finished` | no (resets to 1 at the boundary) | **+1** | **yes** — the composition boundary |
+| 2 | none; `RunTerminal` if exhausted | `model_output_received`, then `retry` or `terminal` | +1 on retry | no | yes, while budget remains |
+| 3 | none; `RunTerminal` if terminal | `tool_not_found` / `schema_rejected` / `authorization_rejected` / `policy_rejected` | +1 on retry (`SCHEMA_INVALID`) | no | only for the retryable code |
+| 4 | `RunTerminal(failed, <outstanding>)` | `completion_rejected_during_repair`, `terminal` | no | no | **no** |
+| 5 | `ExecutionAuthorized`, `ExecutionCompleted(failed, reason)` | `execution_failed`, then `retry` / `retry_withheld` / `terminal` | +1 on retry | no | only if retried |
+| 6 | a *second* `ExecutionAuthorized` at the same `step_id`, attempt k+1, then `ExecutionCompleted(succeeded)` | as case 1 | already incremented | **+1** (the execution, counted once) | yes |
+| 7 | `RunTerminal(failed, RETRY_EXHAUSTED, attempts)` | `terminal` | no | no | **no** |
+| 8 | `RunTerminal(failed, POLICY_DENIED, attempts=1)` | `execution_ceiling_exhausted`, `terminal` | **no** — non-retryable | no | **no** |
+| 9 | `RunTerminal(succeeded, attempts=last_execution_attempts)` | `execution_complete_declared`, `terminal` | no | no | **no** |
+| 10 | `OperatorDecisionRecorded`, `ExecutionCompleted`, `RunTerminal(succeeded)` — **no second `ExecutionAuthorized`** | `recovery_planned`, `operator_decision_recorded`, `recovery_revalidated`, `recovery_resumed`, `execution_finished`, `terminal` | no — the crashed attempt is restored | +1 for this invocation (§7.6) | **no** — the recovery boundary |
+| 11 | none — replay writes nothing | none — replay has no recorder | no | no | **no** — replay never calls a model |
+
+---
+
+## 11. Invariants
+
+Numbered so tests can cite them.
+
+**I1 — single choke point.** Every state change passes through `Run.advance`
+and is a member of `TRANSITIONS`. `TERMINAL` has no outgoing edges.
+
+**I2 — step identity.** `step_id == f"{run_id}-s{execution_index}"`;
+`execution_index` increments exactly once per verified execution, and never on
+an attempt, rejection, failure or operator decision.
+
+**I3 — attempt identity.** `tool_call_id == f"{step_id}-a{attempt}"`;
+`1 <= attempt <= max_attempts`; `attempt` resets to 1 only at a composition
+boundary.
+
+**I4 — execution identity.** `execution_id ==
+derive_execution_id(run_id, step_id, attempt, tool, canonical_args)`, computed
+after all gates and before any physical effect. No model-supplied value names
+an identity.
+
+**I5 — no model-caused success.** A fresh run reaches `succeeded` only via an
+affirmative completion the controller honoured at a composition boundary. A
+recovered run reaches `succeeded` with the adapter never called.
+
+**I6 — completion is not a repair.** A completion arriving while
+`feedback is not None` is refused, and the run terminates on the outstanding
+error code.
+
+**I7 — the ceiling gates requests, not termination.** `max_executions` refuses
+proposals beyond capacity and never refuses, delays or converts a completion.
+
+**I8 — recovery reuses identity.** `(step_id, attempt, tool, arguments,
+execution_id)` all come from the journal, are all re-derived, and any
+disagreement refuses the recovery by a named slug.
+
+**I9 — recovery authorizes nothing new.** A resume writes no second
+`ExecutionAuthorized`.
+
+**I10 — recovery manufactures no generation.** After the recovered execution
+verifies, the run terminates; no `GENERATE` follows `RESPOND`, and the adapter
+call count for a first-attempt resume is 0.
+
+**I11 — no slot is double-consumed.** A recovered `-s2` remains `-s2`.
+
+**I12 — the persisted ceiling is authoritative.** `RunStarted.max_executions`
+must equal `RunContext.max_executions` on every recovery and replay, else
+`journal_execution_ceiling_mismatch`.
+
+**I13 — replay executes nothing** and reaches no `ToolSpec.executor`.
+
+**I14 — determinism.** Identity and ordering derive only from controller-owned
+counters, content hashes and recorded sequence numbers: no clock, no
+randomness, no set-iteration order, no filesystem enumeration.
+
+**I15 — semantic independence.** Each execution's classification,
+authorization, digest, disposition and retry gate are read per-`ToolSpec` and
+per-record. No run-level aggregate of any semantic axis exists.
+
+---
+
+## 12. Compatibility boundaries and known gaps
+
+### Explicit boundaries (intentional, permanent until revisited)
+
+**B1 — recovery does not compose.** §1 and §7.5. This is the M10 boundary, and
+it is a decision rather than a limitation. Milestone 6's §22.8 deviation
+deferred exactly this, and M10 keeps it deferred *for the stated semantic
+reason*, not for convenience.
+
+**B2 — recovery reports a per-invocation execution count.** §7.6.
+
+**B3 — enforced execution deadlines.** `ToolSpec.timeout_seconds` remains
+declarative. M8's debt, carried forward unchanged and still not made to look
+enforced.
+
+### Gaps (contract exceeds implementation; to be closed, not redefined)
+
+**G-VERIFY — verified success is not a durable fact.**
+`ExecutionCompleted(succeeded)` is written before `VERIFY` runs, so the journal
+cannot distinguish "the executor returned" from "the controller accepted the
+result". Consequence: the run-level composed-execution count is not
+reconstructible (§7.6), and a journal whose last execution failed verification
+looks, durably, like one that succeeded until the following authorization
+record disambiguates it.
+
+**G-REPLAY — replay reconstructs an illegal transition under composition.**
+§9. `VERIFY → PARSE` is absent from `TRANSITIONS`.
+
+**G-COUNTS — two fields named for executions mean different things.**
+`RunOutcome.executions` counts executions *verified*;
+`ReplayResult.executions_completed` counts every `ExecutionCompleted` record,
+*including failures*. Before composition nobody could compare them; now they
+can be compared and will disagree.
+
+**G-AUDIT — `run_created` records `max_attempts` only.** The composition
+ceiling is durable in `RunStarted` but absent from the in-memory event stream,
+so an audit of events alone cannot say what capacity a run held.
+
+**G-PLAN — recovery plans describe only the latest execution** when none is
+pending (Phase 0 gap G4). Defensible for a resume decision, incomplete as a
+description of a composed run.
+
+---
+
+## 13. Rejected alternatives
+
+**Treating "no tool call proposed" as run completion.** It inverts a named
+fail-closed test, makes one wire value mean two different things depending on
+position, and makes model silence indistinguishable from task success.
+
+**A `has_more` / `continue_execution` / `done` boolean on `ModelResponse`.** A
+control field on an untrusted channel. `ExecutionComplete` is not this: it is a
+proposal-shaped statement the parser validates and §4 governs, not a boolean
+the controller obeys.
+
+**A `{"type": "execution_complete"}` envelope.** Correct in the abstract,
+unreachable through the production adapter (§3.7).
+
+**A caller-supplied plan or step list.** That is a workflow. It would move the
+decision of *which capabilities run* from the model's proposals to a static
+structure. Out of scope.
+
+**A scheduler, execution queue, orchestrator, DAG, `ExecutionManager`,
+`WorkflowManager`, `Pipeline` or `CompositionManager`.** Not needed and not
+built. Composition needs the existing loop to be allowed to go round again, not
+a manager for a list of operations.
+
+**`while True` with an implicit termination heuristic.** The first rejected
+alternative wearing different clothes.
+
+**Stopping the composition question once the ceiling is full.** §3.6. It
+reports truncation as success.
+
+**Making `RESPOND → GENERATE` unconditional.** The edge exists; taking it is
+conditional on a fresh run having verified an execution. A recovered run never
+takes it (§7.5).
+
+---
+
+## 14. Assumptions
+
+Unchanged from M5–M9: `fsync` durability, append ordering, advisory `flock`,
+POSIX semantics, `O_NOFOLLOW` and `O_APPEND` honoured by the filesystem,
+trustworthy configured roots, and no in-process circumvention of the registry.
+
+Still unproven, and stated as such: that any deployed LocalAI instance
+populates `choices[].finish_reason` (which is why the completion contract does
+not depend on it), and that a model will comply with an affirmative completion
+signal at all (which is why §5's ceiling is required rather than optional).
+
+Not claimed anywhere: exactly-once, atomic, transactional, durable-across-media
+-failure, rollback-safe, crash-safe or linearizable.
