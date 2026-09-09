@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from conftest import (
+    COMPLETION_RESPONSE,
     RECOVERY_MESSAGES,
     VALID_PROPOSAL,
     CrashingJournal,
@@ -755,7 +756,10 @@ def _uninterrupted_run(tmp_path: Path, run_id: str) -> Any:
     """Path A: an ordinary successful run, journalled."""
     path = tmp_path / f"{run_id}.jsonl"
     executor = FakeFileSearchExecutor()
-    adapter = ScriptedModelAdapter((ModelResponse(structured_output=VALID_PROPOSAL),))
+    adapter = ScriptedModelAdapter(
+        # Milestone 10: an uninterrupted run now ends on affirmative completion.
+        (ModelResponse(structured_output=VALID_PROPOSAL), COMPLETION_RESPONSE)
+    )
     context = RunContext(run_id=run_id)
     with RunJournal(path) as journal:
         outcome = asyncio.run(

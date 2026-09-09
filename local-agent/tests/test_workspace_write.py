@@ -794,7 +794,10 @@ def test_an_idempotent_capability_that_fails_after_writing_is_retried(
     """
     inner = WorkspaceWriteExecutor(write_tree.roots)
     executor = WriteThenFailExecutor(inner)
-    outcome, _ = run_write(write_tree, "retry.txt", "attempt\n", executor=executor)
+    # `complete=False`: this test is about spending the attempt budget, so the
+    # model must keep proposing. A completion mid-repair is refused as "not a
+    # repair" and would end the run after one write.
+    outcome, _ = run_write(write_tree, "retry.txt", "attempt\n", executor=executor, complete=False)
 
     assert not outcome.succeeded
     assert outcome.terminal.code == "RETRY_EXHAUSTED"
@@ -1503,6 +1506,8 @@ def test_an_api_key_never_reaches_a_write_argument_result_or_journal(
     executor = WorkspaceWriteExecutor(write_tree.roots)
     registry = build_writable_filesystem_registry(write_tree.roots, write_executor=executor)
     config = model_config(api_key=WRITE_SENTINELS["api_key"])
+    from conftest import completion_transport
+
     transport = ScriptedTransport(
         (
             ok(
@@ -1511,6 +1516,9 @@ def test_an_api_key_never_reaches_a_write_argument_result_or_journal(
                     arguments={"root_id": "workspace", "path": "keyed.txt", "content": "safe"},
                 )
             ),
+            # Milestone 10: the run ends on affirmative completion, and this
+            # harness drives the production adapter, so it arrives over the wire.
+            completion_transport(),
         )
     )
     adapter = LocalAIModelAdapter(

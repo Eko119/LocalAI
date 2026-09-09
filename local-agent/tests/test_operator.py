@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from conftest import (
+    COMPLETION_RESPONSE,
     RECOVERY_MESSAGES,
     VALID_PROPOSAL,
     build_recovery_harness,
@@ -654,7 +655,9 @@ def test_an_uninterrupted_run_needs_no_recovery(tmp_path: Path) -> None:
     path = tmp_path / "clean.jsonl"
     executor = FakeFileSearchExecutor()
     registry = build_default_registry(executor)
-    adapter = ScriptedModelAdapter((ModelResponse(structured_output=VALID_PROPOSAL),))
+    adapter = ScriptedModelAdapter(
+        (ModelResponse(structured_output=VALID_PROPOSAL), COMPLETION_RESPONSE)
+    )
     context = RunContext(run_id="run-clean")
     with RunJournal(path) as journal:
         import asyncio

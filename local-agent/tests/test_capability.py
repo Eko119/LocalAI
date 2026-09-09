@@ -26,11 +26,13 @@ from typing import Any, cast
 
 import pytest
 from conftest import (
+    COMPLETION_RESPONSE,
     RECOVERY_MESSAGES,
     VALID_PROPOSAL,
     FailingExecutor,
     SimulatedCrash,
     build_recovery_harness,
+    completion_transport,
     crash_mid_execution,
 )
 from pydantic import BaseModel, ValidationError
@@ -442,11 +444,22 @@ class CountingSideEffect:
         raise ToolExecutionError("downstream hiccup")
 
 
-def _run(registry: ToolRegistry) -> Any:
+def _run(registry: ToolRegistry, complete: bool = True) -> Any:
+    """Drive one run against `registry`.
+
+    Milestone 10: a run ends only when the model affirmatively completes, so a
+    single-execution success scripts two turns. `complete=False` is for tests
+    whose purpose is to exhaust the attempt budget — a completion offered mid
+    repair is refused as "not a repair", which would end the run early on the
+    outstanding error instead of on exhaustion.
+    """
+    script: tuple[ModelResponse, ...] = (ModelResponse(structured_output=VALID_PROPOSAL),)
+    if complete:
+        script += (COMPLETION_RESPONSE,)
     return asyncio.run(
-        Controller(
-            registry, ScriptedModelAdapter((ModelResponse(structured_output=VALID_PROPOSAL),))
-        ).run(RunContext(run_id="r", max_attempts=3), RECOVERY_MESSAGES)
+        Controller(registry, ScriptedModelAdapter(script)).run(
+            RunContext(run_id="r", max_attempts=3), RECOVERY_MESSAGES
+        )
     )
 
 
@@ -466,7 +479,15 @@ def test_in_run_retry_respects_the_side_effect_classification(
     capability that had never claimed repeating was safe.
     """
     executor = CountingSideEffect()
-    outcome = _run(ToolRegistry((admit(spec(executor=executor, side_effect=classification)),)))
+    # `complete=False`: this row is *about* spending the attempt budget, so the
+    # model must keep proposing rather than completing. A completion offered
+    # mid-repair is refused as "not a repair" and would end the run after one
+    # effect, which would make rows A and B silently agree with row C for
+    # entirely the wrong reason.
+    outcome = _run(
+        ToolRegistry((admit(spec(executor=executor, side_effect=classification)),)),
+        complete=False,
+    )
 
     assert executor.effects == expected_effects
     assert outcome.terminal.status == "failed"
@@ -742,7 +763,7 @@ def test_an_executor_cannot_widen_its_own_result_past_verification() -> None:
         "authorized": True,
         "max_attempts": 999,
     }
-    outcome = _run(registry)
+    outcome = _run(registry, complete=False)
 
     assert not outcome.succeeded
     assert outcome.terminal.code == "RETRY_EXHAUSTED"
@@ -1077,7 +1098,7 @@ def test_a_physical_root_never_reaches_a_capability_facing_surface(tmp_path: Pat
     proposal = json.dumps(
         {"tool": "workspace.read", "arguments": {"root_id": "workspace", "path": "note.txt"}}
     )
-    adapter = ScriptedModelAdapter((ModelResponse(structured_output=proposal),))
+    adapter = ScriptedModelAdapter((ModelResponse(structured_output=proposal), COMPLETION_RESPONSE))
     context = build_filesystem_run_context("run-root")
     outcome = asyncio.run(Controller(registry, adapter).run(context, RECOVERY_MESSAGES))
 
@@ -1115,7 +1136,16 @@ def test_an_api_key_never_reaches_a_capability_facing_surface(tmp_path: Path) ->
     registry = build_default_registry(executor)
     config = model_config(api_key=SENTINELS["api_key"])
     transport = ScriptedTransport(
-        (ok(chat_completion(tool="file_search", arguments={"query": "q", "root_id": "workspace"})),)
+        (
+            ok(
+                chat_completion(
+                    tool="file_search", arguments={"query": "q", "root_id": "workspace"}
+                )
+            ),
+            # Milestone 10: the completion has to come over the wire here,
+            # because this harness drives the production adapter.
+            completion_transport(),
+        )
     )
     adapter = LocalAIModelAdapter(
         transport=transport, config=config, tools=describe_tools(registry)

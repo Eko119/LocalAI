@@ -64,7 +64,10 @@ def test_a_valid_tool_call_flows_through_the_real_adapter() -> None:
     assert outcome.result is not None
     assert outcome.result.model_dump()["data"] == ["clutch_replacement.md"]
     assert harness.executor.call_count == 1
-    assert harness.transport.call_count == 1
+    # Milestone 10: +1 for the affirmative completion turn. A run ends only
+    # when the model says it is finished, so a successful single-execution
+    # run asks the model once more than it used to.
+    assert harness.transport.call_count == 2
     assert outcome.states[-1] is State.TERMINAL
 
 
@@ -474,7 +477,10 @@ def test_the_request_carries_no_retry_budget_or_policy_internals() -> None:
     )
     outcome = harness.run()
     assert outcome.succeeded
-    assert harness.transport.call_count == 2
+    # Milestone 10: +1 for the affirmative completion turn. A run ends only
+    # when the model says it is finished, so a successful single-execution
+    # run asks the model once more than it used to.
+    assert harness.transport.call_count == 3
 
     second = harness.transport.bodies[1]
     assert (
@@ -564,7 +570,10 @@ def test_a_recoverable_failure_then_success() -> None:
 
     assert outcome.succeeded
     assert outcome.attempts == 2
-    assert harness.transport.call_count == 2
+    # Milestone 10: +1 for the affirmative completion turn. A run ends only
+    # when the model says it is finished, so a successful single-execution
+    # run asks the model once more than it used to.
+    assert harness.transport.call_count == 3
     assert harness.executor.call_count == 1
 
 
@@ -576,7 +585,10 @@ def test_two_failures_then_success_on_the_third_attempt() -> None:
 
     assert outcome.succeeded
     assert outcome.attempts == 3
-    assert harness.transport.call_count == 3
+    # Milestone 10: +1 for the affirmative completion turn. A run ends only
+    # when the model says it is finished, so a successful single-execution
+    # run asks the model once more than it used to.
+    assert harness.transport.call_count == 4
 
 
 def test_failing_forever_terminates_at_the_budget() -> None:
@@ -812,7 +824,10 @@ def test_a_failing_attempt_never_substitutes_a_different_model() -> None:
     outcome = harness.run()
 
     assert outcome.succeeded
-    assert harness.transport.call_count == 3
+    # Milestone 10: +1 for the affirmative completion turn. A run ends only
+    # when the model says it is finished, so a successful single-execution
+    # run asks the model once more than it used to.
+    assert harness.transport.call_count == 4
     models = {json.loads(body)["model"] for body in harness.transport.bodies}
     assert models == {"test-model"}
 
