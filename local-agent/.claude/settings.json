@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run pytest:*)",
+      "Bash(uv run ruff:*)",
+      "Bash(uv run mypy:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv lock:*)"
+    ],
+    "deny": [
+      "Bash(docker:*)",
+      "Bash(playwright:*)",
+      "Bash(huggingface-cli:*)",
+      "Bash(pip install:*)",
+      "Bash(sudo:*)",
+      "Read(./.env)",
+      "Read(./**/.env)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(uv add:*)",
+      "Bash(uv remove:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/milestone_scope_guard.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

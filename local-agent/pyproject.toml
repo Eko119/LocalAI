@@ -1,0 +1,38 @@
+[project]
+name = "local-agent"
+version = "0.1.0"
+description = "Milestone 1: deterministic controller foundation for the local AI agent. The model proposes; the controller decides, authorizes, executes, and verifies."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.9,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "mypy>=1.11,<2",
+    "ruff>=0.6,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `live` marks the opt-in LocalAI integration tests. They skip unless
+# LOCAL_AGENT_LIVE_MODEL is set, so the default `pytest -q` needs no server.
+markers = ["live: requires a running LocalAI instance (opt-in, never in CI)"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
